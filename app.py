@@ -42,7 +42,7 @@ except Exception:  # Optional dependency.
 
 
 HOST = os.getenv("HOST", "127.0.0.1")
-PORT = int(os.getenv("PORT", "8000"))
+PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = Path(__file__).with_name("decision_engine.db")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
