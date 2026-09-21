@@ -1218,4 +1218,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    server = ThreadingHTTPServer((HOST, PORT), AppHandler)
+    server.serve_forever()
