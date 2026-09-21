@@ -1,33 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-التوصية — Jordanian Recommendation Engine (v2 — production-ready)
-
-Run (dev):
-    python app.py
-
-Run (prod):
-    gunicorn app:application --bind 0.0.0.0:8000
-
-Optional Gemini extraction:
-    pip install -U google-generativeai
-    export GOOGLE_API_KEY="..."
-
-v2 changes over v1:
-  - No DB deletion on boot (schema is CREATE IF NOT EXISTS + seed-if-empty).
-  - /healthz endpoint for Render health checks.
-  - WSGI application callable (`application`) so gunicorn works correctly.
-  - Hard vs Soft budget constraints (hard_max / soft_target / flexible /
-    cheapest / quality_first).
-  - Size extraction per product type (bra band/cup, shoe EU/US, clothing
-    letters, scarf dimensions).
-  - New categories: shoes, lingerie, scarves (+ matching seed inventory).
-  - Color exclusions ("ما بدي أسود").
-  - Sessions + /api/refine follow-up ("بدي أرخص"، "مش شرط الأسود").
-  - Human-readable reasons per recommendation.
-  - PaymentProvider abstraction (MockCliqProvider).
-"""
-
 from __future__ import annotations
 
 import html
@@ -51,7 +21,7 @@ except Exception:  # Optional dependency.
     genai = None
 
 
-HOST = os.getenv("HOST", "127.0.0.1")
+HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 DB_PATH = Path(os.getenv("DATABASE_FILE", "decision_engine.db"))
 if not DB_PATH.is_absolute():
@@ -97,284 +67,286 @@ class Offer:
 
 SEED_OFFERS: Sequence[Offer] = (
     Offer(1, "Luxe Amman", "أحمر شفاه مات أسود Velvet Noir", "makeup", 9.0,
-          ["lipstick", "matte", "black", "velvet", "حومرة", "روج"],
-          ["black", "أسود"], ["luxury", "evening"], "عمّان",
-          "أحمر شفاه مات بدرجة سوداء عميقة وثبات طويل للمناسبات والتنسيقات الجريئة.",
-          "https://images.unsplash.com/photo-1586495777744-4413f21062fa?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000001", "https://instagram.com/luxe.amman"),
+    ["lipstick", "matte", "black", "velvet", "حومرة", "روج"],
+    ["black", "أسود"], ["luxury", "evening"], "عمّان",
+    "أحمر شفاه مات بدرجة سوداء عميقة وثبات طويل للمناسبات والتنسيقات الجريئة.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com"),
     Offer(2, "Nude House JO", "روج سائل أسود Black Ink", "makeup", 7.5,
-          ["liquid lipstick", "lip", "black", "حومرة", "روج", "أسود"],
-          ["black", "أسود"], ["minimal", "bold"], "عمّان",
-          "روج سائل بتركيبة مرنة ولمعة مطفّية ناعمة.",
-          "https://images.unsplash.com/photo-1596462502278-27bfdc403348?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000002", "https://instagram.com/nudehousejo"),
+    ["liquid lipstick", "lip", "black", "حومرة", "روج", "أسود"],
+    ["black", "أسود"], ["minimal", "bold"], "عمّان",
+    "روج سائل بتركيبة مرنة ولمعة مطفّية ناعمة.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com"),
     Offer(3, "Amman Beauty Lab", "روج مخملي أسود مع محدد شفاه", "makeup", 12.0,
-          ["lipstick", "liner", "black", "makeup", "حومرة", "مكياج"],
-          ["black", "أسود"], ["professional", "night"], "عمّان",
-          "ثنائية روج ومحدد بدرجة أسود كلاسيكية لإطلالة مسائية متكاملة.",
-          "https://images.unsplash.com/photo-1512496015851-a90fb38ba796?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000003", "https://instagram.com/ammanbeautylab"),
+    ["lipstick", "liner", "black", "makeup", "حومرة", "مكياج"],
+    ["black", "أسود"], ["professional", "night"], "عمّان",
+    "ثنائية روج ومحدد بدرجة أسود كلاسيكية لإطلالة مسائية متكاملة.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com"),
     Offer(4, "The Makeup Room", "باقة مكياج العيون Black Smoke", "makeup", 18.0,
-          ["eyeshadow", "smokey", "black", "makeup", "مكياج"],
-          ["black", "grey", "أسود", "رمادي"], ["party", "night"], "الزرقاء",
-          "لوحة ظلال دخانية بدرجات سوداء ورمادية مناسبة للسهرات.",
-          "https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000004", "https://instagram.com/themakeuproomjo"),
+    ["eyeshadow", "smokey", "black", "makeup", "مكياج"],
+    ["black", "grey", "أسود", "رمادي"], ["party", "night"], "الزرقاء",
+    "لوحة ظلال دخانية بدرجات سوداء ورمادية مناسبة للسهرات.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com"),
     Offer(5, "Maison 7", "فستان مخمل أسود للحفلات", "clothes", 34.0,
-          ["dress", "party", "black", "velvet", "فستان", "حفلة", "أسود"],
-          ["black", "أسود"], ["party", "velvet", "elegant"], "عمّان",
-          "فستان سهرة مخمل أسود بقصة أنيقة ومناسبة للحفلات والمناسبات.",
-          "https://images.unsplash.com/photo-1566174053879-31528523f8ae?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000005", "https://instagram.com/maison7jo",
-          ["S", "M", "L"], "clothing_letter"),
+    ["dress", "party", "black", "velvet", "فستان", "حفلة", "أسود"],
+    ["black", "أسود"], ["party", "velvet", "elegant"], "عمّان",
+    "فستان سهرة مخمل أسود بقصة أنيقة ومناسبة للحفلات والمناسبات.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com",
+    ["S", "M", "L"], "clothing_letter"),
     Offer(6, "Luna Amman", "فستان ساتان أسود محتشم", "clothes", 39.0,
-          ["dress", "satin", "modest", "black", "فستان", "ساتان", "محتشم"],
-          ["black", "أسود"], ["modest", "satin", "formal"], "عمّان",
-          "فستان ساتان انسيابي بتفاصيل محتشمة وتصميم مناسب للعشاء والمناسبات.",
-          "https://images.unsplash.com/photo-1591369822096-ffd140ec948f?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000006", "https://instagram.com/lunaamman",
-          ["M", "L", "XL"], "clothing_letter"),
+    ["dress", "satin", "modest", "black", "فستان", "ساتان", "محتشم"],
+    ["black", "أسود"], ["modest", "satin", "formal"], "عمّان",
+    "فستان ساتان انسيابي بتفاصيل محتشمة وتصميم مناسب للعشاء والمناسبات.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com",
+    ["M", "L", "XL"], "clothing_letter"),
     Offer(7, "Silk Avenue", "طقم ساتان محتشم لسهرة هادئة", "clothes", 29.0,
-          ["satin set", "modest", "black", "robe", "طقم", "ساتان", "محتشم"],
-          ["black", "أسود"], ["modest", "lounge", "evening"], "إربد",
-          "طقم ساتان مريح وأنيق بقصة هادئة وألوان حيادية.",
-          "https://images.unsplash.com/photo-1595882100582-7dfd0a3a2f76?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000007", "https://instagram.com/silkavenuejo",
-          ["S", "M", "L", "XL"], "clothing_letter"),
+    ["satin set", "modest", "black", "robe", "طقم", "ساتان", "محتشم"],
+    ["black", "أسود"], ["modest", "lounge", "evening"], "إربد",
+    "طقم ساتان مريح وأنيق بقصة هادئة وألوان حيادية.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com",
+    ["S", "M", "L", "XL"], "clothing_letter"),
     Offer(8, "Noir Closet", "فستان أسود بسيط بقصة مستقيمة", "clothes", 24.0,
-          ["dress", "black", "basic", "minimal", "فستان", "أسود"],
-          ["black", "أسود"], ["minimal", "day", "night"], "عمّان",
-          "فستان أسود عملي يمكن تنسيقه للدوام أو المناسبات الخفيفة.",
-          "https://images.unsplash.com/photo-1515372039744-b8f02a3ae446?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000008", "https://instagram.com/noirclosetjo",
-          ["S", "M", "L", "XL"], "clothing_letter"),
+    ["dress", "black", "basic", "minimal", "فستان", "أسود"],
+    ["black", "أسود"], ["minimal", "day", "night"], "عمّان",
+    "فستان أسود عملي يمكن تنسيقه للدوام أو المناسبات الخفيفة.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com",
+    ["S", "M", "L", "XL"], "clothing_letter"),
     Offer(9, "Wardrobe JO", "عباية ساتان سوداء بلمعة ناعمة", "clothes", 46.0,
-          ["abaya", "satin", "modest", "black", "عباية", "ساتان", "أسود"],
-          ["black", "أسود"], ["modest", "luxury"], "السلط",
-          "عباية ساتان سوداء بتفصيل انسيابي وخياطة نظيفة.",
-          "https://images.unsplash.com/photo-1525507119028-ed4c629a60a3?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000009", "https://instagram.com/wardrobejo",
-          ["M", "L", "XL"], "clothing_letter"),
+    ["abaya", "satin", "modest", "black", "عباية", "ساتان", "أسود"],
+    ["black", "أسود"], ["modest", "luxury"], "السلط",
+    "عباية ساتان سوداء بتفصيل انسيابي وخياطة نظيفة.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com",
+    ["M", "L", "XL"], "clothing_letter"),
     Offer(10, "Gift District", "بوكس هدية أسود فاخر مع ورد مجفف", "gifts", 22.0,
-          ["gift box", "black", "flowers", "هدية", "بوكس", "ورد", "أسود"],
-          ["black", "cream", "أسود", "كريمي"], ["luxury", "romantic"], "عمّان",
-          "بوكس هدية جاهز مع تغليف فاخر وورد مجفف وبطاقة صغيرة.",
-          "https://images.unsplash.com/photo-1513883049090-d0b7439799bf?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000010", "https://instagram.com/giftdistrictjo"),
+    ["gift box", "black", "flowers", "هدية", "بوكس", "ورد", "أسود"],
+    ["black", "cream", "أسود", "كريمي"], ["luxury", "romantic"], "عمّان",
+    "بوكس هدية جاهز مع تغليف فاخر وورد مجفف وبطاقة صغيرة.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com"),
     Offer(11, "Amman Gifting Co.", "طقم هدية فضي أنيق", "gifts", 26.0,
-          ["gift", "silver", "set", "هدية", "فضي", "طقم"],
-          ["silver", "فضي", "white", "أبيض"], ["elegant", "classic"], "عمّان",
-          "مجموعة هدايا أنيقة بتغليف فضي تصلح للتخرج والمناسبات.",
-          "https://images.unsplash.com/photo-1512909006721-3d6018887383?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000011", "https://instagram.com/ammangifting"),
+    ["gift", "silver", "set", "هدية", "فضي", "طقم"],
+    ["silver", "فضي", "white", "أبيض"], ["elegant", "classic"], "عمّان",
+    "مجموعة هدايا أنيقة بتغليف فضي تصلح للتخرج والمناسبات.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com"),
     Offer(12, "Little Luxe", "سوار هدية مع علبة سوداء", "gifts", 14.0,
-          ["gift", "bracelet", "black box", "هدية", "سوار", "علبة"],
-          ["gold", "black", "ذهبي", "أسود"], ["classic", "gift"], "إربد",
-          "سوار بسيط داخل علبة سوداء فاخرة وجاهز للإهداء.",
-          "https://images.unsplash.com/photo-1548036328-c9fa89d128fa?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000012", "https://instagram.com/littleluxjo"),
+    ["gift", "bracelet", "black box", "هدية", "سوار", "علبة"],
+    ["gold", "black", "ذهبي", "أسود"], ["classic", "gift"], "إربد",
+    "سوار بسيط داخل علبة سوداء فاخرة وجاهز للإهداء.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com"),
     Offer(13, "Jabal Amman Watches", "ساعة كلاسيكية ذهبية بسوار معدني", "watches", 69.0,
-          ["watch", "gold", "classic", "gold watch", "ساعة", "ذهبي"],
-          ["gold", "black", "ذهبي", "أسود"], ["classic", "formal"], "عمّان",
-          "ساعة كلاسيكية بلمسة ذهبية مناسبة للهدية والمظهر الرسمي.",
-          "https://images.unsplash.com/photo-1523170335258-f5ed11844a49?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000013", "https://instagram.com/jabalammanwatches"),
+    ["watch", "gold", "classic", "gold watch", "ساعة", "ذهبي"],
+    ["gold", "black", "ذهبي", "أسود"], ["classic", "formal"], "عمّان",
+    "ساعة كلاسيكية بلمسة ذهبية مناسبة للهدية والمظهر الرسمي.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com"),
     Offer(14, "Time House", "ساعة سوداء Minimal Dial", "watches", 55.0,
-          ["watch", "black", "minimal", "ساعة", "أسود", "كلاسيك"],
-          ["black", "silver", "أسود", "فضي"], ["minimal", "classic"], "عمّان",
-          "قرص أسود بسيط بتفاصيل فضية يناسب اللبس اليومي والرسمي.",
-          "https://images.unsplash.com/photo-1524805444758-089113d48a6d?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000014", "https://instagram.com/timehousejo"),
+    ["watch", "black", "minimal", "ساعة", "أسود", "كلاسيك"],
+    ["black", "silver", "أسود", "فضي"], ["minimal", "classic"], "عمّان",
+    "قرص أسود بسيط بتفاصيل فضية يناسب اللبس اليومي والرسمي.",
+    "https://unsplash.com",
+    "https://wa.me", "https://instagram.com"),
     Offer(15, "Irbid Time", "ساعة جلد بني كلاسيكية", "watches", 49.0,
-          ["watch", "brown", "leather", "classic", "ساعة", "جلد", "بني"],
-          ["brown", "silver", "بني", "فضي"], ["classic", "casual"], "إربد",
-          "ساعة جلدية كلاسيكية مريحة للإطلالات اليومية.",
-          "https://images.unsplash.com/photo-1434056886845-dac89ffe9b56?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000015", "https://instagram.com/irbidtime"),
+    ["watch", "brown", "leather", "classic", "ساعة", "جلد", "بني"],
+    ["brown", "silver", "بني", "فضي"], ["classic", "casual"], "إربد",
+    "ساعة جلدية كلاسيكية مريحة للإطلالات اليومية.",
+
+
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     Offer(16, "Oud Amman", "عطر عود فاخر Royal Oud", "perfumes", 58.0,
-          ["perfume", "oud", "luxury", "عطر", "عود", "فاخر"],
-          ["amber", "black", "عنبر", "أسود"], ["luxury", "night"], "عمّان",
-          "تركيبة عود شرقية دافئة بلمسات عنبر وورد مناسبة للمساء.",
-          "https://images.unsplash.com/photo-1547887538-e3a2f32cb1cc?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000016", "https://instagram.com/oudamman"),
+    ["perfume", "oud", "luxury", "عطر", "عود", "فاخر"],
+    ["amber", "black", "عنبر", "أسود"], ["luxury", "night"], "عمّان",
+    "تركيبة عود شرقية دافئة بلمسات عنبر وورد مناسبة للمساء.",
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     Offer(17, "Scent 7", "دهن عود مركز 12 مل", "perfumes", 32.0,
-          ["oud oil", "oud", "perfume", "دهن عود", "عطر", "عود"],
-          ["amber", "brown", "عنبر", "بني"], ["arabic", "luxury"], "عمّان",
-          "دهن عود مركز بحجم عملي وثبات واضح للتنسيق اليومي والمناسبات.",
-          "https://images.unsplash.com/photo-1594035910387-fea47794261f?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000017", "https://instagram.com/scent7jo"),
+    ["oud oil", "oud", "perfume", "دهن عود", "عطر", "عود"],
+    ["amber", "brown", "عنبر", "بني"], ["arabic", "luxury"], "عمّان",
+    "دهن عود مركز بحجم عملي وثبات واضح للتنسيق اليومي والمناسبات.",
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     Offer(18, "Layali Perfumes", "عطر شرقي أسود Midnight", "perfumes", 44.0,
-          ["perfume", "black", "oriental", "عطر", "شرقي", "أسود"],
-          ["black", "amber", "أسود", "عنبر"], ["night", "oriental"], "الزرقاء",
-          "عطر شرقي داكن بطابع مسائي وقارورة سوداء مطفّية.",
-          "https://images.unsplash.com/photo-1592945403244-b3fbafd7f539?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000018", "https://instagram.com/layaliperfumesjo"),
+    ["perfume", "black", "oriental", "عطر", "شرقي", "أسود"],
+    ["black", "amber", "أسود", "عنبر"], ["night", "oriental"], "الزرقاء",
+    "عطر شرقي داكن بطابع مسائي وقارورة سوداء مطفّية.",
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     Offer(19, "Silver Line JO", "طقم مجوهرات فضي لامع", "gifts", 37.0,
-          ["silver jewelry", "set", "gift", "مجوهرات", "فضي", "هدية", "طقم"],
-          ["silver", "white", "فضي", "أبيض"], ["classic", "gift"], "عمّان",
-          "طقم مجوهرات فضي بلمعة ناعمة مناسب كهدية أو مناسبة.",
-          "https://images.unsplash.com/photo-1535632066927-ab7c9ab60908?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000019", "https://instagram.com/silverlinejo"),
+    ["silver jewelry", "set", "gift", "مجوهرات", "فضي", "هدية", "طقم"],
+    ["silver", "white", "فضي", "أبيض"], ["classic", "gift"], "عمّان",
+    "طقم مجوهرات فضي بلمعة ناعمة مناسب كهدية أو مناسبة.",
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     Offer(20, "Ayla Accessories", "طقم عقد وأقراط فضي", "gifts", 31.0,
-          ["silver jewelry", "necklace", "earrings", "مجوهرات", "عقد", "أقراط", "فضي"],
-          ["silver", "فضي"], ["elegant", "classic"], "العقبة",
-          "عقد وأقراط بتصميم هادئ يصلح للإهداء.",
-          "https://images.unsplash.com/photo-1515562141207-7a88fb7ce338?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000020", "https://instagram.com/aylaaccessories"),
+    ["silver jewelry", "necklace", "earrings", "مجوهرات", "عقد", "أقراط", "فضي"],
+    ["silver", "فضي"], ["elegant", "classic"], "العقبة",
+    "عقد وأقراط بتصميم هادئ يصلح للإهداء.",
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     Offer(21, "Black Label Beauty", "أحمر شفاه أسود ساتان", "makeup", 10.0,
-          ["lipstick", "satin", "black", "حومرة", "روج", "أسود"],
-          ["black", "أسود"], ["satin", "luxury"], "عمّان",
-          "تركيبة ساتان تعطي لونًا أسود واضحًا مع لمعة خفيفة.",
-          "https://images.unsplash.com/photo-1571781926291-c477ebfd024b?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000021", "https://instagram.com/blacklabelbeautyjo"),
+    ["lipstick", "satin", "black", "حومرة", "روج", "أسود"],
+    ["black", "أسود"], ["satin", "luxury"], "عمّان",
+    "تركيبة ساتان تعطي لونًا أسود واضحًا مع لمعة خفيفة.",
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     Offer(22, "Misk Jordan", "عطر مسك وعود بتركيبة ناعمة", "perfumes", 36.0,
-          ["perfume", "musk", "oud", "عطر", "مسك", "عود"],
-          ["amber", "cream", "عنبر", "كريمي"], ["soft", "arabic"], "عمّان",
-          "مزيج ناعم من المسك والعود للاستخدام اليومي والمناسبات الصغيرة.",
-          "https://images.unsplash.com/photo-1615634260167-c8cdede054de?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000022", "https://instagram.com/miskjordan"),
+    ["perfume", "musk", "oud", "عطر", "مسك", "عود"],
+    ["amber", "cream", "عنبر", "كريمي"], ["soft", "arabic"], "عمّان",
+    "مزيج ناعم من المسك والعود للاستخدام اليومي والمناسبات الصغيرة.",
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     Offer(23, "Velvet Edit", "فستان مخمل أسود طويل", "clothes", 52.0,
-          ["dress", "velvet", "long", "black", "فستان", "مخمل", "أسود"],
-          ["black", "أسود"], ["formal", "party", "luxury"], "عمّان",
-          "فستان مخمل طويل بتفاصيل أنيقة للمناسبات الرسمية.",
-          "https://images.unsplash.com/photo-1483985988355-763728e1935b?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000023", "https://instagram.com/velveteditjo",
-          ["M", "L"], "clothing_letter"),
+    ["dress", "velvet", "long", "black", "فستان", "مخمل", "أسود"],
+    ["black", "أسود"], ["formal", "party", "luxury"], "عمّان",
+    "فستان مخمل طويل بتفاصيل أنيقة للمناسبات الرسمية.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["M", "L"], "clothing_letter"),
     Offer(24, "Satin Story", "طقم ساتان أسود مريح وأنيق", "clothes", 33.0,
-          ["satin", "set", "black", "modest", "ساتان", "طقم", "أسود", "محتشم"],
-          ["black", "أسود"], ["modest", "minimal", "evening"], "عمّان",
-          "طقم ساتان بلمسة فاخرة وقصة محتشمة سهلة التنسيق.",
-          "https://images.unsplash.com/photo-1618220179428-22790b461013?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000024", "https://instagram.com/satinstoryjo",
-          ["S", "M", "L"], "clothing_letter"),
+    ["satin", "set", "black", "modest", "ساتان", "طقم", "أسود", "محتشم"],
+    ["black", "أسود"], ["modest", "minimal", "evening"], "عمّان",
+    "طقم ساتان بلمسة فاخرة وقصة محتشمة سهلة التنسيق.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["S", "M", "L"], "clothing_letter"),
     Offer(25, "Golden Hour", "ساعة ذهبية بتصميم كلاسيكي صغير", "watches", 62.0,
-          ["watch", "gold", "classic", "small", "ساعة", "ذهبي", "كلاسيك"],
-          ["gold", "black", "ذهبي", "أسود"], ["classic", "elegant"], "عمّان",
-          "ساعة ذهبية صغيرة بتصميم كلاسيكي للاستخدام اليومي.",
-          "https://images.unsplash.com/photo-1508057198894-247b23fe5ade?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000025", "https://instagram.com/goldenhourjo"),
+    ["watch", "gold", "classic", "small", "ساعة", "ذهبي", "كلاسيك"],
+    ["gold", "black", "ذهبي", "أسود"], ["classic", "elegant"], "عمّان",
+    "ساعة ذهبية صغيرة بتصميم كلاسيكي للاستخدام اليومي.",
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     Offer(26, "Rose & Oud", "مجموعة عطر عود وحجم سفر", "perfumes", 28.0,
-          ["oud", "travel", "perfume", "عود", "سفر", "عطر"],
-          ["brown", "gold", "بني", "ذهبي"], ["travel", "gift"], "إربد",
-          "مجموعة عطر عود وحجم سفر داخل علبة أنيقة مناسبة كهدية.",
-          "https://images.unsplash.com/photo-1595425970377-c9703cf48b6d?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000026", "https://instagram.com/roseandoudjo"),
+    ["oud", "travel", "perfume", "عود", "سفر", "عطر"],
+    ["brown", "gold", "بني", "ذهبي"], ["travel", "gift"], "إربد",
+    "مجموعة عطر عود وحجم سفر داخل علبة أنيقة مناسبة كهدية.",
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     Offer(27, "Maison Gifts", "بوكس تخرج فضي فاخر", "gifts", 23.0,
-          ["graduation", "gift", "silver", "بوكس", "تخرج", "هدية", "فضي"],
-          ["silver", "white", "فضي", "أبيض"], ["graduation", "elegant"], "عمّان",
-          "بوكس تخرج أنيق بتغليف فضي وبطاقة تهنئة قابلة للتخصيص.",
-          "https://images.unsplash.com/photo-1549465220-1a8b9238cd48?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000027", "https://instagram.com/maisongiftsjo"),
+    ["graduation", "gift", "silver", "بوكس", "تخرج", "هدية", "فضي"],
+    ["silver", "white", "فضي", "أبيض"], ["graduation", "elegant"], "عمّان",
+    "بوكس تخرج أنيق بتغليف فضي وبطاقة تهنئة قابلة للتخصيص.",
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     Offer(28, "Nour Accessories", "طقم فضي مع حجر أبيض", "gifts", 42.0,
-          ["silver jewelry", "stone", "gift", "مجوهرات", "فضي", "حجر", "هدية"],
-          ["silver", "white", "فضي", "أبيض"], ["classic", "luxury"], "السلط",
-          "طقم فضي مع حجر أبيض بتصميم نظيف وراقي.",
-          "https://images.unsplash.com/photo-1605100804763-247f67b3557e?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000028", "https://instagram.com/nouraccessoriesjo"),
+    ["silver jewelry", "stone", "gift", "مجوهرات", "فضي", "حجر", "هدية"],
+    ["silver", "white", "فضي", "أبيض"], ["classic", "luxury"], "السلط",
+    "طقم فضي مع حجر أبيض بتصميم نظيف وراقي.",
+    "unsplash.com",
+    "wa.me", "instagram.com"),
     # --- v2: shoes ---
     Offer(29, "Step & Style", "كعب واطي أسود مريح للدوام", "shoes", 27.0,
-          ["heels", "low heel", "black", "shoes", "شوز", "كعب", "كعب واطي", "أسود"],
-          ["black", "أسود"], ["minimal", "day", "classic"], "عمّان",
-          "شوز كعب واطي مريح مناسب للدوام والمشاوير اليومية.",
-          "https://images.unsplash.com/photo-1543163521-1bf539c55dd2?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000029", "https://instagram.com/stepstylejo",
-          ["37", "38", "39", "40"], "shoe_eu"),
+    ["heels", "low heel", "black", "shoes", "شوز", "كعب", "كعب واطي", "أسود"],
+    ["black", "أسود"], ["minimal", "day", "classic"], "عمّان",
+    "شوز كعب واطي مريح مناسب للدوام والمشاوير اليومية.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["37", "38", "39", "40"], "shoe_eu"),
     Offer(30, "Heels House JO", "شوز كعب عالي أسود للسهرات", "shoes", 34.0,
-          ["heels", "high heel", "party", "black", "شوز", "كعب", "سهرة", "أسود"],
-          ["black", "أسود"], ["party", "night", "elegant"], "عمّان",
-          "كعب عالي أنيق بلون أسود مناسب للحفلات والمناسبات المسائية.",
-          "https://images.unsplash.com/photo-1596703263926-eb0762ee17e4?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000030", "https://instagram.com/heelshousejo",
-          ["36", "37", "38", "39", "40", "41"], "shoe_eu"),
+    ["heels", "high heel", "party", "black", "شوز", "كعب", "سهرة", "أسود"],
+    ["black", "أسود"], ["party", "night", "elegant"], "عمّان",
+    "كعب عالي أنيق بلون أسود مناسب للحفلات والمناسبات المسائية.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["36", "37", "38", "39", "40", "41"], "shoe_eu"),
     Offer(31, "Comfort Walk", "سنيكرز أبيض يومي خفيف", "shoes", 22.0,
-          ["sneakers", "white", "casual", "shoes", "سنيكرز", "شوز", "أبيض"],
-          ["white", "أبيض"], ["minimal", "casual", "day"], "إربد",
-          "سنيكرز خفيف ومريح للاستخدام اليومي.",
-          "https://images.unsplash.com/photo-1549298916-b41d501d3772?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000031", "https://instagram.com/comfortwalkjo",
-          ["37", "38", "39", "40", "41", "42"], "shoe_eu"),
+    ["sneakers", "white", "casual", "shoes", "سنيكرز", "شوز", "أبيض"],
+    ["white", "أبيض"], ["minimal", "casual", "day"], "إربد",
+    "سنيكرز خفيف ومريح للاستخدام اليومي.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["37", "38", "39", "40", "41", "42"], "shoe_eu"),
     Offer(32, "Velvet Step", "بوت شتوي بني جلد", "shoes", 39.0,
-          ["boots", "brown", "leather", "winter", "بوت", "شوز", "بني"],
-          ["brown", "بني"], ["classic", "casual"], "عمّان",
-          "بوت جلد بني دافئ للإطلالات الشتوية.",
-          "https://images.unsplash.com/photo-1520639888713-7851133b1ed0?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000032", "https://instagram.com/velvetstepjo",
-          ["38", "39", "40", "41", "42"], "shoe_eu"),
+    ["boots", "brown", "leather", "winter", "بوت", "شوز", "بني"],
+    ["brown", "بني"], ["classic", "casual"], "عمّان",
+    "بوت جلد بني دافئ للإطلالات الشتوية.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["38", "39", "40", "41", "42"], "shoe_eu"),
     Offer(42, "Ballerina JO", "باليرينا سوداء ناعمة", "shoes", 19.0,
-          ["ballerina", "flat", "black", "shoes", "باليرينا", "شوز", "أسود", "فلات"],
-          ["black", "أسود"], ["minimal", "day", "soft"], "عمّان",
-          "باليرينا سوداء مريحة وخفيفة للاستخدام اليومي.",
-          "https://images.unsplash.com/photo-1560343090-f0409e92791a?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000042", "https://instagram.com/ballerinajo",
-          ["36", "37", "38", "39", "40"], "shoe_eu"),
+    ["ballerina", "flat", "black", "shoes", "باليرينا", "شوز", "أسود", "فلات"],
+    ["black", "أسود"], ["minimal", "day", "soft"], "عمّان",
+    "باليرينا سوداء مريحة وخفيفة للاستخدام اليومي.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["36", "37", "38", "39", "40"], "shoe_eu"),
     # --- v2: lingerie ---
     Offer(33, "Intima JO", "برا قطن مريح بدون سلك", "lingerie", 9.0,
-          ["bra", "cotton", "wireless", "برا", "سوتيان", "قطن", "مريح"],
-          ["black", "white", "أسود", "أبيض"], ["minimal", "day"], "عمّان",
-          "برا قطن ناعم بدون سلك معدني، مريح للاستخدام اليومي.",
-          "https://images.unsplash.com/photo-1594744803329-e58b31de8bf5?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000033", "https://instagram.com/intimajo",
-          ["34B", "34C", "36B", "36C", "38C"], "bra"),
+    ["bra", "cotton", "wireless", "برا", "سوتيان", "قطن", "مريح"],
+    ["black", "white", "أسود", "أبيض"], ["minimal", "day"], "عمّان",
+    "برا قطن ناعم بدون سلك معدني، مريح للاستخدام اليومي.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["34B", "34C", "36B", "36C", "38C"], "bra"),
     Offer(34, "Lace & Co", "سوتيان دانتيل أسود فاخر", "lingerie", 12.5,
-          ["bra", "lace", "black", "برا", "سوتيان", "دانتيل", "أسود"],
-          ["black", "أسود"], ["luxury", "elegant"], "عمّان",
-          "سوتيان دانتيل أسود بخامة ناعمة وتفاصيل راقية.",
-          "https://images.unsplash.com/photo-1582639510494-c80b5de9f148?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000034", "https://instagram.com/laceandcojo",
-          ["32B", "34B", "34C", "36C"], "bra"),
+    ["bra", "lace", "black", "برا", "سوتيان", "دانتيل", "أسود"],
+    ["black", "أسود"], ["luxury", "elegant"], "عمّان",
+    "سوتيان دانتيل أسود بخامة ناعمة وتفاصيل راقية.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["32B", "34B", "34C", "36C"], "bra"),
+
     Offer(35, "Soft Touch", "طقم داخلي قطن ناعم", "lingerie", 11.0,
-          ["underwear set", "cotton", "طقم", "داخلي", "لانجيري", "قطن"],
-          ["cream", "pink", "كريمي", "زهري"], ["minimal", "soft"], "الزرقاء",
-          "طقم داخلي قطني ناعم بألوان هادئة.",
-          "https://images.unsplash.com/photo-1616627561950-9f746e330187?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000035", "https://instagram.com/softtouchjo",
-          ["S", "M", "L", "XL"], "clothing_letter"),
+    ["underwear set", "cotton", "طقم", "داخلي", "لانجيري", "قطن"],
+    ["cream", "pink", "كريمي", "زهري"], ["minimal", "soft"], "الزرقاء",
+    "طقم داخلي قطني ناعم بألوان هادئة.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["S", "M", "L", "XL"], "clothing_letter"),
     # --- v2: scarves / hijab ---
     Offer(36, "Hijab House", "طرحة شيفون سوداء خفيفة", "scarves", 6.0,
-          ["scarf", "chiffon", "black", "طرحة", "شيفون", "حجاب", "أسود"],
-          ["black", "أسود"], ["minimal", "day"], "عمّان",
-          "طرحة شيفون خفيفة بثبات جيد للاستخدام اليومي.",
-          "https://images.unsplash.com/photo-1601924994987-69e26d50dc26?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000036", "https://instagram.com/hijabhousejo",
-          ["180x70"], "scarf_dimensions"),
+    ["scarf", "chiffon", "black", "طرحة", "شيفون", "حجاب", "أسود"],
+    ["black", "أسود"], ["minimal", "day"], "عمّان",
+    "طرحة شيفون خفيفة بثبات جيد للاستخدام اليومي.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["180x70"], "scarf_dimensions"),
     Offer(37, "Cotton Wrap", "شال قطن طويل وعريض", "scarves", 8.5,
-          ["scarf", "cotton", "long", "wide", "شال", "قطن", "طويل", "عريض"],
-          ["cream", "grey", "كريمي", "رمادي"], ["modest", "minimal"], "إربد",
-          "شال قطن طويل وعريض بخامة غير شفافة ومريحة.",
-          "https://images.unsplash.com/photo-1583391733956-6c78276477e2?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000037", "https://instagram.com/cottonwrapjo",
-          ["200x80"], "scarf_dimensions"),
+    ["scarf", "cotton", "long", "wide", "شال", "قطن", "طويل", "عريض"],
+    ["cream", "grey", "كريمي", "رمادي"], ["modest", "minimal"], "إربد",
+    "شال قطن طويل وعريض بخامة غير شفافة ومريحة.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["200x80"], "scarf_dimensions"),
     Offer(38, "Medina Scarves", "شال ساتان فاخر للمناسبات", "scarves", 11.0,
-          ["scarf", "satin", "luxury", "شال", "ساتان", "فاخر", "مناسبات"],
-          ["gold", "cream", "ذهبي", "كريمي"], ["luxury", "elegant"], "عمّان",
-          "شال ساتان بلمعة ناعمة مناسب للمناسبات والعزائم.",
-          "https://images.unsplash.com/photo-1601370690183-1c7796ecec61?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000038", "https://instagram.com/medinaScarvesjo",
-          ["190x75"], "scarf_dimensions"),
+    ["scarf", "satin", "luxury", "شال", "ساتان", "فاخر", "مناسبات"],
+    ["gold", "cream", "ذهبي", "كريمي"], ["luxury", "elegant"], "عمّان",
+    "شال ساتان بلمعة ناعمة مناسب للمناسبات والعزائم.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["190x75"], "scarf_dimensions"),
     Offer(39, "Warm Line", "شال صوف شتوي عريض", "scarves", 13.0,
-          ["scarf", "wool", "winter", "wide", "شال", "صوف", "شتاء", "عريض"],
-          ["brown", "grey", "بني", "رمادي"], ["classic", "warm"], "السلط",
-          "شال صوف شتوي عريض وثقيل للتدفئة.",
-          "https://images.unsplash.com/photo-1520903920243-00d872a2d1c9?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000039", "https://instagram.com/warmlinejo",
-          ["200x90"], "scarf_dimensions"),
+    ["scarf", "wool", "winter", "wide", "شال", "صوف", "شتاء", "عريض"],
+    ["brown", "grey", "بني", "رمادي"], ["classic", "warm"], "السلط",
+    "شال صوف شتوي عريض وثقيل للتدفئة.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["200x90"], "scarf_dimensions"),
     # --- v2: extra clothes ---
     Offer(40, "Closet 36", "فستان أسود قصير كاجوال", "clothes", 26.0,
-          ["dress", "short", "casual", "black", "فستان", "أسود", "كاجوال"],
-          ["black", "أسود"], ["minimal", "casual", "day"], "عمّان",
-          "فستان أسود قصير بقصة كاجوال سهلة التنسيق.",
-          "https://images.unsplash.com/photo-1572804013309-59a88b7e92f1?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000040", "https://instagram.com/closet36jo",
-          ["S", "M", "L"], "clothing_letter"),
+    ["dress", "short", "casual", "black", "فستان", "أسود", "كاجوال"],
+    ["black", "أسود"], ["minimal", "casual", "day"], "عمّان",
+    "فستان أسود قصير بقصة كاجوال سهلة التنسيق.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+    ["S", "M", "L"], "clothing_letter"),
     Offer(41, "Urban Thread", "هودي أسود أوفرسايز", "clothes", 18.0,
-          ["hoodie", "oversize", "black", "هودي", "أسود", "اوفرسايز"],
-          ["black", "أسود"], ["casual", "street", "minimal"], "الزرقاء",
-          "هودي أسود أوفرسايز بخامة قطنية ثقيلة.",
-          "https://images.unsplash.com/photo-1556821840-3a63f95609a7?auto=format&fit=crop&w=1000&q=88",
-          "https://wa.me/962790000041", "https://instagram.com/urbanthreadjo",
-          ["M", "L", "XL"], "clothing_letter"),
-)
-
+    ["hoodie", "oversize", "black", "هودي", "أسود", "اوفرسايز"],
+    ["black", "أسود"], ["casual", "street", "minimal"], "الزرقاء",
+    "هودي أسود أوفرسايز بخامة قطنية ثقيلة.",
+    "unsplash.com",
+    "wa.me", "instagram.com",
+["M", "L", "XL"], "clothing_letter"),
+    )
 CATEGORY_LABELS = {
     "makeup": "مكياج",
     "clothes": "ملابس",
@@ -384,42 +356,42 @@ CATEGORY_LABELS = {
     "shoes": "أحذية",
     "lingerie": "ملابس داخلية",
     "scarves": "طرحات وشالات",
-}
+    }
 
 CATEGORY_SYNONYMS: Dict[str, set] = {
     "makeup": {
-        "مكياج", "ميكب", "makeup", "cosmetics", "روج", "حومرة", "حمرة", "حمرا",
-        "احمر شفاه", "أحمر شفاه", "ليبستك", "lipstick", "lip", "عيون", "بلشر",
+    "مكياج", "ميكب", "makeup", "cosmetics", "روج", "حومرة", "حمرة", "حمرا",
+    "احمر شفاه", "أحمر شفاه", "ليبستك", "lipstick", "lip", "عيون", "بلشر",
     },
     "clothes": {
-        "ملابس", "لبس", "لبسة", "فستان", "فساتين", "فستين", "فستانه", "عباية", "عبايات",
-        "ساتان", "مخمل", "ثوب", "هودي", "بلوزة", "بلوزه", "تيشيرت", "بنطلون", "جينز",
-        "clothes", "dress", "abaya", "hoodie", "shirt",
+    "ملابس", "لبس", "لبسة", "فستان", "فساتين", "فستين", "فستانه", "عباية", "عبايات",
+    "ساتان", "مخمل", "ثوب", "هودي", "بلوزة", "بلوزه", "تيشيرت", "بنطلون", "جينز",
+    "clothes", "dress", "abaya", "hoodie", "shirt",
     },
     "gifts": {
-        "هدية", "هديه", "هدايا", "بوكس", "تخرج", "gift", "gifts", "جوهرة", "مجوهرات",
-        "فضي", "فضة", "سوار", "عقد", "اقراط", "أقراط", "jewelry", "silver",
+    "هدية", "هديه", "هدايا", "بوكس", "تخرج", "gift", "gifts", "جوهرة", "مجوهرات",
+    "فضي", "فضة", "سوار", "عقد", "اقراط", "أقراط", "jewelry", "silver",
     },
     "watches": {
-        "ساعة", "ساعات", "ساعه", "watch", "watches", "تايم",
+    "ساعة", "ساعات", "ساعه", "watch", "watches", "تايم",
     },
     "perfumes": {
-        "عطر", "عطور", "عطورات", "برفان", "برفانات", "دهن عود", "عود", "مسك",
-        "perfume", "perfumes", "oud", "musk",
+    "عطر", "عطور", "عطورات", "برفان", "برفانات", "دهن عود", "عود", "مسك",
+    "perfume", "perfumes", "oud", "musk",
     },
     "shoes": {
-        "شوز", "حذاء", "كندرة", "كندره", "كعب", "بوت", "سنيكرز", "باليرينا", "فلات",
-        "shoes", "heels", "sneakers", "boots", "ballerina", "flats",
+    "شوز", "حذاء", "كندرة", "كندره", "كعب", "بوت", "سنيكرز", "باليرينا", "فلات",
+    "shoes", "heels", "sneakers", "boots", "ballerina", "flats",
     },
     "lingerie": {
-        "برا", "سوتيان", "لانجيري", "حمالة", "حماله", "داخلي", "كولوت",
-        "bra", "lingerie", "underwear",
+    "برا", "سوتيان", "لانجيري", "حمالة", "حماله", "داخلي", "كولوت",
+    "bra", "lingerie", "underwear",
     },
     "scarves": {
-        "شال", "شالات", "طرحة", "طرحه", "طرحات", "حجاب", "اسكارف", "سكارف",
-        "scarf", "scarves", "hijab", "shawl",
+    "شال", "شالات", "طرحة", "طرحه", "طرحات", "حجاب", "اسكارف", "سكارف",
+    "scarf", "scarves", "hijab", "shawl",
     },
-}
+    }
 
 COLOR_SYNONYMS: Dict[str, set] = {
     "black": {"أسود", "اسود", "سوداء", "سوده", "black", "noir"},
@@ -428,15 +400,15 @@ COLOR_SYNONYMS: Dict[str, set] = {
     "silver": {"فضي", "فضية", "فضه", "فضة", "silver"},
     "gold": {"ذهبي", "ذهب", "ذهبية", "gold", "golden"},
     "brown": {"بني", "بنية", "brown"},
-    "cream": {"كريمي", "سكري", "cream", "off-white"},
+    "cream": {"kريمي", "سكري", "cream", "off-white"},
     "grey": {"رمادي", "رصاصي", "grey", "gray"},
     "pink": {"زهري", "وردي", "pink"},
-}
+    }
 
 COLOR_AR = {
     "black": "أسود", "white": "أبيض", "red": "أحمر", "silver": "فضي",
     "gold": "ذهبي", "brown": "بني", "cream": "كريمي", "grey": "رمادي", "pink": "زهري",
-}
+    }
 
 STYLE_SYNONYMS: Dict[str, set] = {
     "luxury": {"فاخر", "فخم", "فخمه", "luxury", "راقي", "رقي", "classy", "افخم", "أفخم"},
@@ -445,7 +417,7 @@ STYLE_SYNONYMS: Dict[str, set] = {
     "classic": {"كلاسيك", "كلاسيكي", "كلاسيكية", "classic", "رسمي", "formal"},
     "minimal": {"بسيط", "ناعم", "مينيمال", "minimal"},
     "gift": {"هدية", "هديه", "gift"},
-}
+    }
 
 STOPWORDS = {
     "بدي", "بديش", "بدّي", "بدها", "بده", "شي", "اشي", "شيء", "الي", "إلي", "لي",
@@ -453,13 +425,7 @@ STOPWORDS = {
     "تحت", "اقل", "أقل", "من", "الى", "إلى", "دينار", "ديناراً", "جني", "جنيه", "jod", "jd",
     "بال", "لل", "ال", "و", "يا", "شو", "ايش", "اي", "أي", "بس", "فقط", "لـ", "عن",
     "انا", "أنا", "يكون", "تكون", "هو", "هي", "ممكن", "لو", "اذا", "إذا",
-}
-
-
-# ---------------------------------------------------------------------------
-# JSON serialization guard
-# ---------------------------------------------------------------------------
-
+    }
 def serialize_json(value: Any) -> str:
     if value is None:
         return "[]"
@@ -498,7 +464,6 @@ def tokens(text: str) -> List[str]:
     raw = re.findall(r"[a-z0-9_+#.-]+|[؀-ۿ]+", clean, flags=re.IGNORECASE)
     return [t for t in raw if t not in STOPWORDS]
 
-
 # ---------------------------------------------------------------------------
 # Hard vs Soft budget extraction (v2)
 # ---------------------------------------------------------------------------
@@ -513,13 +478,13 @@ BUDGET_KIND_PATTERNS: Sequence[Tuple[str, str]] = (
 
 _BUDGET_AMOUNT_PATTERNS: Sequence[str] = (
     r"(?:تحت|اقل من|أقل من|لحد|حدود|حد|ميزانية|ميزانيتي|اقصى|أقصى|ما بتتعدى|ما يتجاوز|ما بدفع اكثر من|ما بتدفع اكثر من|ما بزيد عن|بحدود|حوالي|حوالى|تقريبا)\s*(?:هو|هي|ال)?\s*(\d+(?:\.\d+)?)",
-    r"(\d+(?:\.\d+)?)\s*(?:دينار|دينارات|jod|jd|د\.ا|دج)",
+    r"(\d+(?:\.\d+)?)\s*(?:دينار|دينارات|jod|jd|د.ا|دج)",
     r"(?:بـ|ب|حدها|حده)\s*(\d+(?:\.\d+)?)",
 )
 
 
 def extract_budget(text: str) -> Dict[str, Any]:
-    """Return {"amount": float|None, "kind": hard_max|soft_target|flexible|cheapest|quality_first|none}."""
+    """Return budget amount and budget behavior."""
     t = normalize_arabic_digits(normalize_text(text))
     amount: Optional[float] = None
     for pattern in _BUDGET_AMOUNT_PATTERNS:
@@ -528,7 +493,7 @@ def extract_budget(text: str) -> Dict[str, Any]:
             amount = safe_float(m.group(1))
             if amount is not None:
                 break
-    if amount is None and re.search(r"دينار|jod|jd|ميزاني|سعر|تحت|اقل|لحد|حدود|اكثر|أكثر|يتجاوز|\$", t, re.I):
+    if amount is None and re.search(r"دينار|jod|jd|ميزاني|سعر|تحت|اقل|لحد|حدود|اكثر|أكثر|يتجاوز|$", t, re.I):
         m = re.search(r"\b(\d+(?:\.\d+)?)\b", t)
         if m:
             amount = safe_float(m.group(1))
@@ -539,9 +504,8 @@ def extract_budget(text: str) -> Dict[str, Any]:
             kind = k
             break
     if kind == "none" and amount is not None:
-        kind = "hard_max"  # رقم مع سياق ميزانية بدون تليين = قيد صارم افتراضيًا
+        kind = "hard_max"
     return {"amount": amount, "kind": kind}
-
 
 # ---------------------------------------------------------------------------
 # Size extraction per product type (v2)
@@ -552,7 +516,7 @@ SHOE_EU_RE = re.compile(r"\b(3[5-9]|4[0-6])\s*(eu|أوروبي|اوروبي|أو
 SHOE_US_RE = re.compile(r"\b([5-9]|1[0-2])\s*(us|أمريكي|امريكي|امريكى)\b", re.I)
 CLOTH_LETTER_RE = re.compile(r"\b(xxs|xs|s|m|l|xl|xxl|xxxl)\b", re.I)
 CLOTH_NUM_RE = re.compile(r"\b(3[4-9]|4[0-8])\b")
-DIM_RE = re.compile(r"(\d{2,3})\s*[×xX*]\s*(\d{2,3})")
+DIM_RE = re.compile(r"(\d{2,3})\s*[×xX]\s*(\d{2,3})")
 
 _SHOE_CONTEXT = r"شوز|حذاء|كندرة|كعب|مقاس|بوت|سنيكرز|باليرينا|فلات|shoe|heel"
 _CLOTH_CONTEXT = r"فستان|فساتين|ملابس|لبس|عباية|هودي|بلوزة|ثوب|dress|clothes"
@@ -563,8 +527,12 @@ def extract_sizes(text: str, categories: Optional[List[str]] = None) -> Dict[str
     out: Dict[str, Any] = {"system": None, "value": None, "band": None, "cup": None}
     m = BRA_RE.search(t)
     if m and not re.search(r"(?:أوروبي|اوروبي|eu)\b", t):
-        out.update(system="bra", band=int(m.group(1)), cup=m.group(2).upper(),
-                   value=f"{m.group(1)}{m.group(2).upper()}")
+        out.update(
+            system="bra",
+            band=int(m.group(1)),
+            cup=m.group(2).upper(),
+            value=f"{m.group(1)}{m.group(2).upper()}",
+        )
         return out
     m = SHOE_US_RE.search(t)
     if m:
@@ -587,7 +555,6 @@ def extract_sizes(text: str, categories: Optional[List[str]] = None) -> Dict[str
         out.update(system="clothing_numeric", value=int(m.group(1)))
         return out
     return out
-
 
 # ---------------------------------------------------------------------------
 # Category / color / style / terms detection
@@ -633,7 +600,6 @@ def detect_styles(text: str) -> List[str]:
                 break
     return found
 
-
 _EXCLUDE_RE = re.compile(r"(?:ما بدي|ما بده|ما بدها|مش|مو|بدون|من غير)\s+([؀-ۿA-Za-z]+)")
 _EXCLUDE_IGNORE = {"شرط", "مهم", "ضروري", "مشكلة", "ايش", "شي"}
 
@@ -667,7 +633,6 @@ def detect_brand(text: str) -> Optional[str]:
 def detect_product_terms(text: str) -> List[str]:
     clean = normalize_text(text)
     return [t for t in tokens(clean) if len(t) > 1 and not re.fullmatch(r"\d+(?:\.\d+)?", t)]
-
 
 # ---------------------------------------------------------------------------
 # Optional Gemini extraction (extended schema)
@@ -759,7 +724,8 @@ def merge_extraction(local: Dict[str, Any], ai: Dict[str, Any]) -> Dict[str, Any
         if ai_amount is not None:
             budget["amount"] = ai_amount
             budget["kind"] = ai_budget.get("kind") if ai_budget.get("kind") in {
-                "hard_max", "soft_target", "flexible", "cheapest", "quality_first"} else "hard_max"
+                "hard_max", "soft_target", "flexible", "cheapest", "quality_first"
+            } else "hard_max"
 
     sizes = local.get("sizes", {})
     if not sizes.get("system") and isinstance(ai.get("sizes"), dict):
@@ -812,9 +778,8 @@ def extract_intent(user_text: str, use_ai: bool = True) -> Dict[str, Any]:
     ai = extract_with_gemini(user_text) if use_ai else {}
     return merge_extraction(local, ai)
 
-
 # ---------------------------------------------------------------------------
-# Follow-up refinement (v2) — "بدي أرخص" / "أفخم" / "مش شرط الأسود"
+# Follow-up refinement (v2)
 # ---------------------------------------------------------------------------
 
 def refine_intent(prev: Dict[str, Any], new_text: str) -> Dict[str, Any]:
@@ -833,12 +798,14 @@ def refine_intent(prev: Dict[str, Any], new_text: str) -> Dict[str, Any]:
             merged["colors"] = [c for c in merged.get("colors", []) if c not in drop]
         elif re.search(r"لون", t):
             merged["colors"] = []
-        if new.get("sizes", {}).get("system") is None and re.search(r"مقاس", t):
-            merged["sizes"] = {"system": None, "value": None, "band": None, "cup": None}
+    if new.get("sizes", {}).get("system") is None and re.search(r"مقاس", t):
+        merged["sizes"] = {"system": None, "value": None, "band": None, "cup": None}
     if re.search(r"مش مهم السعر|السعر مش مهم|ما عندي مشكلة بالسعر", t):
         merged["budget"] = {"amount": None, "kind": "quality_first"}
         merged["priority"] = "quality"
-    elif new.get("budget", {}).get("amount") is not None or new.get("budget", {}).get("kind") in ("cheapest", "quality_first"):
+    elif new.get("budget", {}).get("amount") is not None or new.get("budget", {}).get("kind") in (
+        "cheapest", "quality_first"
+    ):
         merged["budget"] = new["budget"]
         if new["budget"]["kind"] == "cheapest":
             merged["priority"] = "cheapest"
@@ -861,85 +828,80 @@ def refine_intent(prev: Dict[str, Any], new_text: str) -> Dict[str, Any]:
         merged["brand_soft"] = new["brand_soft"]
     return merged
 
-
-# ---------------------------------------------------------------------------
-# SQLite schema and repository (v2 — NO deletion on boot, seed-if-missing)
-# ---------------------------------------------------------------------------
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS buyer_intents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    request_id TEXT NOT NULL UNIQUE,
-    raw_query TEXT NOT NULL,
-    categories TEXT NOT NULL,
-    colors TEXT NOT NULL,
-    styles TEXT NOT NULL,
-    product_terms TEXT NOT NULL,
-    price_cap_jod REAL,
-    budget_json TEXT NOT NULL DEFAULT '{}',
-    sizes_json TEXT NOT NULL DEFAULT '{}',
-    ai_payload TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+request_id TEXT NOT NULL UNIQUE,
+raw_query TEXT NOT NULL,
+categories TEXT NOT NULL,
+colors TEXT NOT NULL,
+styles TEXT NOT NULL,
+product_terms TEXT NOT NULL,
+price_cap_jod REAL,
+budget_json TEXT NOT NULL DEFAULT '{}',
+sizes_json TEXT NOT NULL DEFAULT '{}',
+ai_payload TEXT NOT NULL,
+created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS merchant_offers (
-    id INTEGER PRIMARY KEY,
-    merchant_name TEXT NOT NULL,
-    title TEXT NOT NULL,
-    category TEXT NOT NULL,
-    price_jod REAL NOT NULL CHECK(price_jod >= 0),
-    tags TEXT NOT NULL,
-    colors TEXT NOT NULL,
-    style TEXT NOT NULL,
-    city TEXT NOT NULL,
-    description TEXT NOT NULL,
-    image_url TEXT NOT NULL,
-    whatsapp_url TEXT NOT NULL,
-    instagram_url TEXT NOT NULL,
-    sizes TEXT NOT NULL DEFAULT '[]',
-    size_system TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+id INTEGER PRIMARY KEY,
+merchant_name TEXT NOT NULL,
+title TEXT NOT NULL,
+category TEXT NOT NULL,
+price_jod REAL NOT NULL CHECK(price_jod >= 0),
+tags TEXT NOT NULL,
+colors TEXT NOT NULL,
+style TEXT NOT NULL,
+city TEXT NOT NULL,
+description TEXT NOT NULL,
+image_url TEXT NOT NULL,
+whatsapp_url TEXT NOT NULL,
+instagram_url TEXT NOT NULL,
+sizes TEXT NOT NULL DEFAULT '[]',
+size_system TEXT NOT NULL DEFAULT '',
+created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS products (
-    product_id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    category TEXT,
-    subcategory TEXT,
-    description TEXT,
-    price REAL,
-    currency TEXT DEFAULT 'JOD',
-    old_price REAL,
-    discount REAL,
-    brand TEXT,
-    color TEXT,
-    size TEXT,
-    size_system TEXT,
-    material TEXT,
-    features TEXT,
-    tags TEXT,
-    rating REAL,
-    review_count INTEGER,
-    image_url TEXT,
-    store_name TEXT,
-    product_url TEXT,
-    shipping_cost REAL,
-    availability TEXT,
-    location TEXT,
-    last_checked TEXT,
-    source TEXT,
-    raw_data TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+product_id TEXT PRIMARY KEY,
+name TEXT NOT NULL,
+category TEXT,
+subcategory TEXT,
+description TEXT,
+price REAL,
+currency TEXT DEFAULT 'JOD',
+old_price REAL,
+discount REAL,
+brand TEXT,
+color TEXT,
+size TEXT,
+size_system TEXT,
+material TEXT,
+features TEXT,
+tags TEXT,
+rating REAL,
+review_count INTEGER,
+image_url TEXT,
+store_name TEXT,
+product_url TEXT,
+shipping_cost REAL,
+availability TEXT,
+location TEXT,
+last_checked TEXT,
+source TEXT,
+raw_data TEXT,
+created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT PRIMARY KEY,
-    user_ip TEXT,
-    intent_json TEXT NOT NULL DEFAULT '{}',
-    paid INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+session_id TEXT PRIMARY KEY,
+user_ip TEXT,
+intent_json TEXT NOT NULL DEFAULT '{}',
+paid INTEGER DEFAULT 0,
+created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_offers_category ON merchant_offers(category);
@@ -948,7 +910,6 @@ CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_products_price ON products(price);
 CREATE INDEX IF NOT EXISTS idx_products_brand ON products(brand);
 """
-
 
 def _ensure_columns(conn: sqlite3.Connection, table: str, columns: Dict[str, str]) -> None:
     existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -965,7 +926,6 @@ def init_db() -> None:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(_SCHEMA)
-            # ترقية قواعد بيانات v1 القديمة بدون فقدان بياناتها
             _ensure_columns(conn, "merchant_offers", {
                 "sizes": "TEXT NOT NULL DEFAULT '[]'",
                 "size_system": "TEXT NOT NULL DEFAULT ''",
@@ -1058,8 +1018,10 @@ def create_session(session_id: str, intent: Dict[str, Any], user_ip: str = "") -
 def get_session_intent(session_id: str) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     try:
-        row = conn.execute("SELECT intent_json FROM sessions WHERE session_id = ?",
-                           (session_id,)).fetchone()
+        row = conn.execute(
+            "SELECT intent_json FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
         if not row:
             return None
         try:
@@ -1104,11 +1066,6 @@ def get_offers() -> List[Offer]:
     finally:
         conn.close()
 
-
-# ---------------------------------------------------------------------------
-# Ranking with Hard/Soft budgets + sizes + explanations (v2)
-# ---------------------------------------------------------------------------
-
 def normalized_set(values: Iterable[str]) -> set:
     return {normalize_text(v) for v in values if v}
 
@@ -1149,7 +1106,7 @@ def size_match(offer: Offer, sizes: Dict[str, Any]) -> Optional[bool]:
     if not system:
         return None
     if not offer.sizes:
-        return None  # المنتج بدون بيانات مقاس — لا نعاقبه
+        return None
     if system == "bra":
         if offer.size_system != "bra":
             return False
@@ -1161,16 +1118,16 @@ def size_match(offer: Offer, sizes: Dict[str, Any]) -> Optional[bool]:
         return str(sizes.get("value")) in offer.sizes
     if system == "shoe_us":
         if offer.size_system != "shoe_us":
-            return None  # لا نرفض لاختلاف النظام، فقط لا نكافئ
+            return None
         return str(sizes.get("value")) in offer.sizes
-    if system in ("clothing_letter",):
+    if system == "clothing_letter":
         if offer.size_system != "clothing_letter":
             return False
         return str(sizes.get("value", "")).upper() in {s.upper() for s in offer.sizes}
     if system == "clothing_numeric":
-        return None  # soft — نكافئ فقط عند التطابق النصي
+        return None
     if system == "scarf_dimensions":
-        return None  # soft
+        return None
     return None
 
 
@@ -1185,7 +1142,6 @@ def score_offer(offer: Offer, intent: Dict[str, Any]) -> Tuple[float, List[str]]
     sizes = intent.get("sizes", {}) or {}
     reasons: List[str] = []
 
-    # ---- Hard filters ----
     if not budget_allows(budget, offer.price_jod):
         return -1.0, []
     offer_color_canon = {c for c in offer.colors if c in COLOR_SYNONYMS}
@@ -1231,7 +1187,6 @@ def score_offer(offer: Offer, intent: Dict[str, Any]) -> Tuple[float, List[str]]
         elif len(term) >= 3 and term in clean_desc:
             score += 1.5
 
-    # ---- Budget fit ----
     amount = budget.get("amount")
     kind = budget.get("kind", "none")
     if amount:
@@ -1243,12 +1198,10 @@ def score_offer(offer: Offer, intent: Dict[str, Any]) -> Tuple[float, List[str]]
             distance = abs(offer.price_jod - amount) / max(amount, 1)
             score += max(0.0, 6.0 * (1 - distance))
             reasons.append(f"قريب من ميزانيتك ({offer.price_jod:.0f} د.أ)")
-        elif kind == "flexible":
-            if offer.price_jod <= amount:
-                score += 4.0
+        elif kind == "flexible" and offer.price_jod <= amount:
+            score += 4.0
             reasons.append(f"سعره {offer.price_jod:.0f} د.أ وميزانيتك مرنة")
 
-    # ---- Sizes ----
     if sm is True:
         score += 25.0
         system = sizes.get("system")
@@ -1259,7 +1212,6 @@ def score_offer(offer: Offer, intent: Dict[str, Any]) -> Tuple[float, List[str]]
         elif system == "clothing_letter":
             reasons.append(f"متوفر بمقاس {sizes.get('value')}")
 
-    # ---- Priorities ----
     if intent.get("priority") == "cheapest":
         score += max(0.0, 15.0 - offer.price_jod * 0.3)
     if intent.get("priority") == "quality" and "luxury" in offer.style:
@@ -1285,11 +1237,6 @@ def recommend(intent: Dict[str, Any]) -> List[Dict[str, Any]]:
     else:
         results.sort(key=lambda item: (-item["score"], item["price_jod"], item["id"]))
     return results
-
-
-# ---------------------------------------------------------------------------
-# Payment abstraction (v2)
-# ---------------------------------------------------------------------------
 
 class PaymentProvider:
     """Interface — بدّلي الـ implementation لما يتوفر API رسمي."""
@@ -1318,357 +1265,273 @@ class MockCliqProvider(PaymentProvider):
         }
 
     def verify(self, session_id: str) -> bool:
-        return False  # لا تحقق تلقائي في النسخة اليدوية
+        return False
 
 
 PAYMENT_PROVIDER: PaymentProvider = MockCliqProvider()
+HTML_TEMPLATE = r"""
 
 
-# ---------------------------------------------------------------------------
-# HTML UI (v2 — reasons, refine follow-up, dynamic placeholder)
-# ---------------------------------------------------------------------------
-
-HTML_TEMPLATE = r'''<!doctype html>
-<html lang="ar" dir="rtl">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#FAFAFA" />
-  <meta name="description" content="التوصية — محرك توصية يفهم اللهجة الأردنية ويجمع العروض المطابقة." />
-  <title>التوصية — محرك التوصية الأردني</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800;900&display=swap" rel="stylesheet" />
-  <style>
-    :root { color-scheme: light; }
-    html, body { min-height: 100%; }
-    body { font-family: 'Tajawal', system-ui, sans-serif; background: #FAFAFA; }
-    .glass { background: rgba(255,255,255,.84); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); }
-    .soft-shadow { box-shadow: 0 1px 0 rgba(17,24,39,.04), 0 16px 50px rgba(17,24,39,.055); }
-    .hide-links a { filter: blur(6px); pointer-events: none; user-select: none; }
-    .hide-links::after {
-      content: '🔒 التواصل مع التاجر يظهر بعد تأكيد قراءة تعليمات دفع 1 دينار عبر CliQ';
-      position: absolute; inset: 0; display:flex; align-items:center; justify-content:center;
-      padding: 1rem; border-radius: 1.25rem; background: rgba(255,255,255,.86);
-      color: #171717; font-size:.78rem; font-weight:800; text-align:center;
-      border: 1px solid rgba(0,0,0,.05); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
-    }
-    .safe-bottom { padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
-    @keyframes pulse-soft { 0%,100% { opacity:.55; } 50% { opacity:1; } }
-    .pulse-soft { animation: pulse-soft 1.4s ease-in-out infinite; }
-  </style>
-</head>
-<body class="text-neutral-900 tracking-tight">
-  <div class="min-h-screen flex flex-col">
-    <header class="sticky top-0 z-40 border-b border-neutral-100 glass">
-      <div class="mx-auto max-w-3xl px-4 sm:px-6 py-3.5 sm:py-4 flex items-center justify-between gap-3">
-        <div class="flex items-center gap-3 min-w-0">
-          <div class="h-11 w-11 shrink-0 rounded-2xl bg-neutral-950 text-white grid place-items-center text-lg font-black">ت</div>
-          <div class="min-w-0">
-            <div class="text-[11px] text-neutral-400 font-bold">محرك التوصية الأردني</div>
-            <h1 class="text-lg sm:text-xl font-black truncate">التوصية الذكية</h1>
-          </div>
-        </div>
-        <span class="hidden sm:inline-flex rounded-full bg-neutral-950 text-white px-3 py-1.5 text-[10px] font-black tracking-widest">VIP LIVE FEED</span>
-      </div>
-    </header>
-
-    <main class="flex-1 mx-auto max-w-3xl w-full px-4 sm:px-6 pt-6 sm:pt-10 pb-24">
-      <section class="text-center mb-8 sm:mb-10">
-        <div class="inline-flex items-center gap-2 rounded-full bg-white border border-neutral-100 px-3 py-1.5 text-[11px] font-bold text-neutral-500 shadow-sm mb-4">
-          <span>✦</span><span>اكتبي طلبك بحرية</span><span>•</span><span>لهجة أردنية / شامية</span>
-        </div>
-        <h2 class="text-3xl sm:text-4xl font-black leading-[1.25] text-neutral-900">
-          تعبتِ من اللف والدوران؟<br />
-          <span class="text-neutral-400 font-medium text-xl sm:text-2xl">اكتبي شو بدك… والباقي علينا.</span>
-        </h2>
-        <p class="mt-4 text-sm text-neutral-500 max-w-xl mx-auto leading-7">
-          فضفضي بأي صياغة طبيعية — بنفهم المقاسات، الميزانية الصارمة والمرنة، والألوان المرفوضة. وبعدين تقدري تعدّلي طلبك: «بدي أرخص»، «بدي أفخم»، «مش شرط الأسود».
-        </p>
-      </section>
-
-      <section class="bg-white p-4 sm:p-5 rounded-[2rem] sm:rounded-[2.5rem] border border-neutral-200/70 soft-shadow relative overflow-hidden">
-        <form id="searchForm" class="space-y-3">
-          <div class="rounded-3xl bg-neutral-50 border border-neutral-100 p-2">
-            <textarea id="query" rows="3" required maxlength="2000"
-              placeholder="احكيلنا شو ببالك… حتى بالعامية"
-              class="w-full bg-transparent px-4 py-3.5 outline-none text-sm sm:text-base font-medium text-neutral-800 resize-none placeholder:text-neutral-300 leading-7"></textarea>
-          </div>
-          <div class="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
-            <div class="text-[11px] text-neutral-400 font-medium bg-neutral-50 border border-neutral-100 px-3 py-2.5 rounded-2xl leading-5">
-              💡 ما في كلمات مفتاحية إجبارية — اكتبي زي ما بتحكي مع صاحبتك.
-            </div>
-            <button id="searchBtn" type="submit" class="w-full sm:w-auto min-h-[54px] bg-neutral-950 hover:bg-neutral-800 text-white font-black text-sm px-8 rounded-2xl transition active:scale-[0.985]">
-              أرسلي الطلب ✦
-            </button>
-          </div>
-        </form>
-        <form id="refineForm" class="hidden mt-3 flex gap-2">
-          <input id="refineInput" maxlength="500" placeholder="عدّلي طلبك: بدي أرخص / بدي أفخم / مش شرط الأسود…"
-            class="flex-1 rounded-2xl bg-neutral-50 border border-neutral-100 px-4 py-3 text-sm font-medium outline-none placeholder:text-neutral-300" />
-          <button type="submit" class="min-h-[48px] px-5 rounded-2xl bg-white border border-neutral-200 hover:bg-neutral-50 font-black text-sm transition">حدّثي ↻</button>
-        </form>
-        <div id="intentPills" class="mt-4 flex flex-wrap gap-1.5 pt-3 border-t border-neutral-50"></div>
-      </section>
-
-      <section class="mt-10 sm:mt-12 text-right">
-        <div class="flex items-center justify-between gap-3 mb-5">
-          <div>
-            <div class="text-[10px] font-bold text-neutral-400 uppercase tracking-widest">LIVE MATCHES</div>
-            <h3 id="resultsTitle" class="mt-1 text-lg font-black text-neutral-900">اكتبي طلبكِ لنبدأ الفرز</h3>
-          </div>
-          <span id="countBadge" class="hidden shrink-0 rounded-full bg-white border border-neutral-100 px-3 py-1.5 text-xs font-black text-neutral-500 shadow-sm"></span>
-        </div>
-
-        <div id="loading" class="hidden rounded-3xl bg-white border border-neutral-100 p-10 sm:p-12 text-center text-sm font-bold text-neutral-400 soft-shadow">
-          <div class="text-2xl mb-3 pulse-soft">✦</div>
-          جاري تحليل نيتكِ الشرائية وجمع كل العروض المطابقة…
-        </div>
-
-        <div id="empty" class="rounded-3xl bg-white border border-neutral-100 p-10 sm:p-12 text-center soft-shadow">
-          <div class="text-3xl mb-3 text-neutral-300">✦</div>
-          <div class="font-black text-neutral-700">لا توجد عروض معروضة حالياً</div>
-          <div class="text-xs text-neutral-400 mt-1 leading-6">ابدئي بكتابة طلبك بالأعلى لرؤية العروض المطابقة.</div>
-        </div>
-
-        <div id="grid" class="grid grid-cols-1 sm:grid-cols-2 gap-5 mt-5"></div>
-      </section>
-    </main>
-
-    <div id="dealModal" class="hidden fixed inset-0 z-50 bg-black/60 backdrop-blur-sm p-4 flex items-center justify-center">
-      <div class="w-full max-w-md rounded-[2rem] bg-white p-5 sm:p-6 shadow-2xl border border-neutral-100">
-        <div class="flex items-start justify-between gap-3 border-b border-neutral-100 pb-4">
-          <div>
-            <div class="text-[10px] text-neutral-400 font-black uppercase tracking-widest">DEAL ACCESS</div>
-            <h4 class="text-lg font-black mt-1">افتحي الصفقة بقيمة 1 دينار</h4>
-          </div>
-          <button type="button" onclick="closeDealModal()" class="h-10 w-10 rounded-full bg-neutral-50 hover:bg-neutral-100 font-black text-neutral-500 flex items-center justify-center">×</button>
-        </div>
-        <div class="mt-5 rounded-3xl bg-neutral-50 border border-neutral-100 p-4 sm:p-5 text-right">
-          <div class="font-black text-neutral-900 flex items-center gap-2">⚡ دفع CliQ محلي</div>
-          <p class="mt-2 text-xs text-neutral-500 leading-6">
-            لإظهار روابط التواصل المباشرة للمتجر، استخدمي الدفع المحلي بقيمة <span class="font-black text-neutral-900">1 دينار أردني فقط</span> عبر نظام CliQ.
-          </p>
-          <div class="mt-4 space-y-2">
-            <div class="rounded-2xl bg-white border border-neutral-100 p-3 flex items-center justify-between gap-3">
-              <span class="text-[11px] text-neutral-400 font-bold">البنك المستهدف</span>
-              <span class="text-sm font-black text-neutral-900">البنك العربي (Arab Bank)</span>
-            </div>
-            <div class="rounded-2xl bg-white border border-neutral-100 p-3 flex items-center justify-between gap-3">
-              <span class="text-[11px] text-neutral-400 font-bold">Alias ID / Username</span>
-              <span class="font-mono font-black text-neutral-900 tracking-wider">MQRB</span>
-            </div>
-          </div>
-        </div>
-        <label class="mt-4 p-3.5 rounded-2xl bg-neutral-50/70 border border-neutral-100 flex items-start gap-3 cursor-pointer select-none">
-          <input id="paidCheck" type="checkbox" class="mt-1 h-5 w-5 rounded border-neutral-300 accent-neutral-900" />
-          <span class="text-xs text-neutral-600 font-bold leading-6">أؤكد أنني قرأت تعليمات الدفع اليدوي بقيمة 1 دينار عبر CliQ إلى البنك العربي باستخدام <span class="font-black">MQRB</span>.</span>
-        </label>
-        <button type="button" onclick="confirmDeal()" class="mt-4 w-full min-h-[56px] rounded-3xl bg-neutral-950 hover:bg-neutral-800 text-white font-black text-sm transition active:scale-[0.99]">
-          أؤكد التعليمات وأظهر التواصل ✦
-        </button>
-        <div class="mt-3 text-center text-[10px] text-neutral-400 leading-5">هذه الشاشة لا تتحقق من التحويل البنكي تلقائياً؛ التأكيد هنا يحرر الروابط في الواجهة فقط.</div>
-      </div>
-    </div>
-  </div>
-
-<script>
-  const form = document.getElementById('searchForm');
-  const refineForm = document.getElementById('refineForm');
-  const refineInput = document.getElementById('refineInput');
-  const queryEl = document.getElementById('query');
-  const searchBtn = document.getElementById('searchBtn');
-  const grid = document.getElementById('grid');
-  const empty = document.getElementById('empty');
-  const loading = document.getElementById('loading');
-  const resultsTitle = document.getElementById('resultsTitle');
-  const countBadge = document.getElementById('countBadge');
-  const intentPills = document.getElementById('intentPills');
-  const dealModal = document.getElementById('dealModal');
-  let activeCard = null;
-  let sessionId = null;
-
-  const EX = [
-    "بدي فستان أسود لحفلة تحت 30",
-    "بدي هدية ناعمة لصاحبتي عمرها 23 بحدود 15",
-    "بدي شوز كعبه واطي مقاسي 38 أوروبي",
-    "بدي شال طويل وعريض ومش شيفون",
-    "بدي برا 34C مريح",
-    "بدي شي مثل Zara بس أرخص"
-  ];
-  let exIdx = 0;
-  setInterval(() => { if (document.activeElement !== queryEl && !queryEl.value) queryEl.placeholder = EX[exIdx++ % EX.length]; }, 2800);
-
-  const esc = (v) => String(v ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
-  const money = (v) => { const n = Number(v); return `${n.toFixed(Number.isInteger(n) ? 0 : 2)} د.أ`; };
-  const categoryNames = {makeup:'مكياج', clothes:'ملابس', gifts:'هدايا', watches:'ساعات', perfumes:'عطور', shoes:'أحذية', lingerie:'ملابس داخلية', scarves:'طرحات وشالات'};
-  const budgetLabels = {hard_max:'حد أقصى', soft_target:'بحدود', flexible:'مرنة حوالي', cheapest:'الأرخص', quality_first:'الجودة أولاً'};
-
-  function renderIntent(intent) {
-    const items = [];
-    (intent.categories || []).forEach(c => items.push(`<span class="rounded-xl bg-neutral-950 text-white px-3 py-1.5 text-xs font-black">${esc(categoryNames[c] || c)}</span>`));
-    (intent.colors || []).forEach(c => items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-bold text-neutral-600">🎨 ${esc(c)}</span>`));
-    (intent.excluded_colors || []).forEach(c => items.push(`<span class="rounded-xl bg-red-50 border border-red-100 px-3 py-1.5 text-xs font-bold text-red-500">🚫 بدون ${esc(c)}</span>`));
-    (intent.styles || []).forEach(c => items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-bold text-neutral-600">✦ ${esc(c)}</span>`));
-    const b = intent.budget || {};
-    if (b.amount !== null && b.amount !== undefined) {
-      items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">💰 ${esc(budgetLabels[b.kind] || 'حتى')} ${esc(money(b.amount))}</span>`);
-    } else if (b.kind === 'cheapest') {
-      items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">💰 بدي الأرخص</span>`);
-    } else if (b.kind === 'quality_first') {
-      items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">✨ الجودة أهم من السعر</span>`);
-    }
-    const s = intent.sizes || {};
-    if (s.system === 'bra') items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">📏 مقاس ${esc(s.band)}${esc(s.cup)}</span>`);
-    else if (s.system === 'shoe_eu') items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">📏 مقاس ${esc(s.value)} أوروبي</span>`);
-    else if (s.system && s.value) items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">📏 مقاس ${esc(s.value)}</span>`);
-    intentPills.innerHTML = items.join('');
-  }
-
-  function productCard(item, index) {
-    const score = Math.round(Number(item.score || 0));
-    const tags = (item.tags || []).slice(0, 5).map(tag => `<span class="rounded-full bg-neutral-100 px-2 py-1 text-[10px] font-bold text-neutral-500">${esc(tag)}</span>`).join('');
-    const reasons = (item.reasons || []).slice(0, 3).map(r =>
-      `<li class="flex items-start gap-1.5 text-[11px] text-emerald-700 font-bold leading-5"><span class="mt-0.5">✓</span><span>${esc(r)}</span></li>`).join('');
-    return `
-      <article class="group bg-white rounded-[2rem] border border-neutral-200/70 overflow-hidden soft-shadow flex flex-col">
-        <div class="relative aspect-[4/5] overflow-hidden bg-neutral-100">
-          <img src="${esc(item.image_url)}" loading="lazy" referrerpolicy="no-referrer" class="h-full w-full object-cover transition duration-700 group-hover:scale-[1.03]" alt="${esc(item.title)}" onerror="this.style.opacity='.18'" />
-          <div class="absolute inset-x-3 top-3 flex items-start justify-between gap-2">
-            <span class="rounded-full bg-white/90 backdrop-blur px-3 py-1.5 text-[10px] font-black shadow-sm">${score}% توافق</span>
-            <span class="rounded-full bg-black/65 text-white backdrop-blur px-3 py-1.5 text-[10px] font-bold">${esc(item.match_type || 'توصية')}</span>
-          </div>
-        </div>
-        <div class="p-4 sm:p-5 flex-1 flex flex-col">
-          <div class="flex items-center justify-between gap-2">
-            <span class="text-[11px] text-neutral-400 font-black">${esc(categoryNames[item.category] || item.category)}</span>
-            <span class="text-[11px] text-neutral-400 font-bold">${esc(item.city)}</span>
-          </div>
-          <h4 class="mt-2 text-sm sm:text-base font-black leading-6">${esc(item.title)}</h4>
-          <div class="mt-1 text-xs text-neutral-400 font-bold">${esc(item.merchant_name)}</div>
-          <p class="mt-2 text-xs sm:text-sm text-neutral-500 leading-6">${esc(item.description)}</p>
-          <ul class="mt-3 space-y-1">${reasons}</ul>
-          <div class="mt-3 flex flex-wrap gap-1.5">${tags}</div>
-          <div class="mt-auto pt-4 flex items-end justify-between gap-3">
-            <div>
-              <div class="text-[10px] text-neutral-400 font-bold">السعر</div>
-              <div class="text-lg font-black">${esc(money(item.price_jod))}</div>
-            </div>
-            <button type="button" onclick='openDeal(${JSON.stringify(item)})' class="min-h-[48px] px-4 rounded-2xl bg-neutral-950 hover:bg-neutral-800 text-white font-black text-xs sm:text-sm transition active:scale-[0.985]">
-              افتحي الصفقة <span class="opacity-60">(1 دينار)</span>
-            </button>
-          </div>
-          <div class="contact-zone relative mt-4 p-2 rounded-2xl border border-neutral-100 hide-links" data-card="${index}">
-            <div class="flex gap-2">
-              <a href="${esc(item.whatsapp_url)}" target="_blank" rel="noopener noreferrer" class="flex-1 text-center rounded-xl bg-emerald-50 text-emerald-700 py-3 text-xs font-black">واتساب المتجر</a>
-              <a href="${esc(item.instagram_url)}" target="_blank" rel="noopener noreferrer" class="flex-1 text-center rounded-xl bg-pink-50 text-pink-700 py-3 text-xs font-black">إنستغرام</a>
-            </div>
-          </div>
-        </div>
-      </article>`;
-  }
-
-  function openDeal(item) {
-    activeCard = item;
-    document.getElementById('paidCheck').checked = false;
-    dealModal.classList.remove('hidden');
-    document.body.classList.add('overflow-hidden');
-  }
-  function closeDealModal() {
-    dealModal.classList.add('hidden');
-    document.body.classList.remove('overflow-hidden');
-  }
-  dealModal.addEventListener('click', (event) => { if (event.target === dealModal) closeDealModal(); });
-  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !dealModal.classList.contains('hidden')) closeDealModal(); });
-  function confirmDeal() {
-    if (!document.getElementById('paidCheck').checked) {
-      alert('الرجاء تأكيد قراءة تعليمات تحويل 1 دينار عبر CliQ إلى البنك العربي — MQRB أولاً.');
-      return;
-    }
-    closeDealModal();
-    document.querySelectorAll('.contact-zone').forEach(el => el.classList.remove('hide-links'));
-    if (activeCard) alert(`تم تحرير روابط التواصل لمنتج: ${activeCard.title}`);
-  }
-
-  function setBusy(busy) {
-    searchBtn.disabled = busy;
-    searchBtn.classList.toggle('opacity-60', busy);
-    searchBtn.classList.toggle('cursor-wait', busy);
-    loading.classList.toggle('hidden', !busy);
-  }
-
-  function renderResults(data) {
-    renderIntent(data.intent);
-    const count = data.results.length;
-    resultsTitle.textContent = count ? 'كل العروض التنافسية المطابقة' : 'لم نجد عروضًا مطابقة لهذه الشروط — جرّبي «مش شرط اللون» أو وسّعي الميزانية';
-    countBadge.textContent = `${count} ${count === 1 ? 'عرض' : 'عروض'}`;
-    countBadge.classList.remove('hidden');
-    grid.innerHTML = data.results.map(productCard).join('');
-    if (!count) empty.classList.remove('hidden');
-    if (count) window.scrollTo({top: grid.offsetTop - 90, behavior: 'smooth'});
-  }
-
-  function renderError(message) {
-    empty.classList.remove('hidden');
-    resultsTitle.textContent = 'صار خطأ في البحث';
-    empty.innerHTML = `<div class="text-4xl mb-3">!</div><div class="font-black">${esc(message)}</div><div class="text-sm text-neutral-500 mt-2">جربي صياغة أخرى للطلب.</div>`;
-  }
-
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const query = queryEl.value.trim();
-    if (!query) return;
-    empty.classList.add('hidden');
-    grid.innerHTML = '';
-    countBadge.classList.add('hidden');
-    resultsTitle.textContent = 'جاري تحليل نيتكِ الشرائية…';
-    setBusy(true);
-    try {
-      const response = await fetch('/api/recommend', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({query})
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'تعذر إتمام البحث');
-      sessionId = data.session_id;
-      refineForm.classList.remove('hidden');
-      renderResults(data);
-    } catch (error) {
-      renderError(error.message);
-    } finally { setBusy(false); }
-  });
-
-  refineForm.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const message = refineInput.value.trim();
-    if (!message || !sessionId) return;
-    setBusy(true);
-    try {
-      const response = await fetch('/api/refine', {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({session_id: sessionId, message})
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'تعذر تحديث الطلب');
-      refineInput.value = '';
-      renderResults(data);
-    } catch (error) {
-      renderError(error.message);
-    } finally { setBusy(false); }
-  });
-
-  queryEl.focus();
-</script>
-</body>
-</html>'''
 
 
-# ---------------------------------------------------------------------------
-# HTTP application — shared router for the dev server AND the WSGI callable
-# ---------------------------------------------------------------------------
 
-STATUS_TEXT = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 500: "Internal Server Error"}
+
+التوصية — محرك التوصية الأردني
+
+
+:root { color-scheme: light; }
+html, body { min-height: 100%; }
+body { font-family: 'Tajawal', system-ui, sans-serif; background: #FAFAFA; }
+.glass { background: rgba(255,255,255,.84); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); }
+.soft-shadow { box-shadow: 0 1px 0 rgba(17,24,39,.04), 0 16px 50px rgba(17,24,39,.055); }
+.hide-links a { filter: blur(6px); pointer-events: none; user-select: none; }
+.hide-links::after {
+content: '🔒 التواصل مع التاجر يظهر بعد تأكيد قراءة تعليمات دفع 1 دينار عبر CliQ';
+position: absolute; inset: 0; display:flex; align-items:center; justify-content:center;
+padding: 1rem; border-radius: 1.25rem; background: rgba(255,255,255,.86);
+color: #171717; font-size:.78rem; font-weight:800; text-align:center;
+border: 1px solid rgba(0,0,0,.05); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+}
+.safe-bottom { padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
+@keyframes pulse-soft { 0%,100% { opacity:.55; } 50% { opacity:1; } }
+.pulse-soft { animation: pulse-soft 1.4s ease-in-out infinite; }
+
+
+
+
+
+ت
+
+محرك التوصية الأردني
+التوصية الذكية
+
+
+VIP LIVE FEED
+
+✦اكتبي طلبك بحرية•لهجة أردنية / شامية
+
+
+تعبتِ من اللف والدوران؟
+
+اكتبي شو بدك… والباقي علينا.
+
+
+فضفضي بأي صياغة طبيعية — بنفهم المقاسات، الميزانية الصارمة والمرنة، والألوان المرفوضة. وبعدين تقدري تعدّلي طلبك: «بدي أرخص»، «بدي أفخم»، «مش شرط الأسود».
+
+💡 ما في كلمات مفتاحية إجبارية — اكتبي زي ما بتحكي مع صاحبتك.
+
+
+أرسلي الطلب ✦
+
+
+
+
+
+حدّثي ↻
+
+
+
+LIVE MATCHES
+اكتبي طلبكِ لنبدأ الفرز
+
+
+
+✦
+جاري تحليل نيتكِ الشرائية وجمع كل العروض المطابقة…
+
+
+✦
+لا توجد عروض معروضة حالياً
+ابدئي بكتابة طلبك بالأعلى لرؤية العروض المطابقة.
+
+
+DEAL ACCESS
+افتحي الصفقة بقيمة 1 دينار
+
+×
+
+
+⚡ دفع CliQ محلي
+
+لإظهار روابط التواصل المباشرة للمتجر، استخدمي الدفع المحلي بقيمة 1 دينار أردني فقط عبر نظام CliQ.
+
+
+
+البنك المستهدف
+البنك العربي (Arab Bank)
+
+
+Alias ID / Username
+MQRB
+
+
+
+أؤكد التعليمات وأظهر التواصل ✦
+
+هذه الشاشة لا تتحقق من التحويل البنكي تلقائياً؛ التأكيد هنا يحرر الروابط في الواجهة فقط.
+
+
+
+const form = document.getElementById('searchForm');
+const refineForm = document.getElementById('refineForm');
+const refineInput = document.getElementById('refineInput');
+const queryEl = document.getElementById('query');
+const searchBtn = document.getElementById('searchBtn');
+const grid = document.getElementById('grid');
+const empty = document.getElementById('empty');
+const loading = document.getElementById('loading');
+const resultsTitle = document.getElementById('resultsTitle');
+const countBadge = document.getElementById('countBadge');
+const intentPills = document.getElementById('intentPills');
+const dealModal = document.getElementById('dealModal');
+let activeCard = null;
+let sessionId = null;
+
+const EX = [
+"بدي فستان أسود لحفلة تحت 30",
+"بدي هدية ناعمة لصاحبتي عمرها 23 بحدود 15",
+"بدي شوز كعبه واطي مقاسي 38 أوروبي",
+"بدي شال طويل وعريض ومش شيفون",
+"بدي برا 34C مريح",
+"بدي شي مثل Zara بس أرخص"
+];
+let exIdx = 0;
+setInterval(() => { if (document.activeElement !== queryEl && !queryEl.value) queryEl.placeholder = EX[exIdx++ % EX.length]; }, 2800);
+
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const money = (v) => { const n = Number(v); return `${n.toFixed(Number.isInteger(n) ? 0 : 2)} د.أ`; };
+const categoryNames = {makeup:'مكياج', clothes:'ملابس', gifts:'هدايا', watches:'ساعات', perfumes:'عطور', shoes:'أحذية', lingerie:'ملابس داخلية', scarves:'طرحات وشالات'};
+const budgetLabels = {hard_max:'حد أقصى', soft_target:'بحدود', flexible:'مرنة حوالي', cheapest:'الأرخص', quality_first:'الجودة أولاً'};
+
+function renderIntent(intent) {
+const items = [];
+(intent.categories || []).forEach(c => items.push(`<span class="rounded-xl bg-neutral-950 text-white px-3 py-1.5 text-xs font-black">${esc(categoryNames[c] || c)}</span>`));
+(intent.colors || []).forEach(c => items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-bold text-neutral-600">🎨 ${esc(c)}</span>`));
+(intent.excluded_colors || []).forEach(c => items.push(`<span class="rounded-xl bg-red-50 border border-red-100 px-3 py-1.5 text-xs font-bold text-red-500">🚫 بدون ${esc(c)}</span>`));
+(intent.styles || []).forEach(c => items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-bold text-neutral-600">✦ ${esc(c)}</span>`));
+const b = intent.budget || {};
+if (b.amount !== null && b.amount !== undefined) {
+items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">💰 ${esc(budgetLabels[b.kind] || 'حتى')} ${esc(money(b.amount))}</span>`);
+} else if (b.kind === 'cheapest') {
+items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">💰 بدي الأرخص</span>`);
+} else if (b.kind === 'quality_first') {
+items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">✨ الجودة أهم من السعر</span>`);
+}
+const s = intent.sizes || {};
+if (s.system === 'bra') items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">📏 مقاس ${esc(s.band)}${esc(s.cup)}</span>`);
+else if (s.system === 'shoe_eu') items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">📏 مقاس ${esc(s.value)} أوروبي</span>`);
+else if (s.system && s.value) items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">📏 مقاس ${esc(s.value)}</span>`);
+intentPills.innerHTML = items.join('');
+}
+
+function productCard(item, index) {
+const score = Math.round(Number(item.score || 0));
+const tags = (item.tags || []).slice(0, 5).map(tag => `<span class="rounded-full bg-neutral-100 px-2 py-1 text-[10px] font-bold text-neutral-500">${esc(tag)}</span>`).join('');
+const reasons = (item.reasons || []).slice(0, 3).map(r =>
+`<li class="flex items-start gap-1.5 text-[11px] text-emerald-700 font-bold leading-5"><span class="mt-0.5">✓</span><span>${esc(r)}</span></li>`).join('');
+return ` <article class="group bg-white rounded-[2rem] border border-neutral-200/70 overflow-hidden soft-shadow flex flex-col"> <div class="relative aspect-[4/5] overflow-hidden bg-neutral-100"> <img src="${esc(item.image_url)}" loading="lazy" referrerpolicy="no-referrer" class="h-full w-full object-cover transition duration-700 group-hover:scale-[1.03]" alt="${esc(item.title)}" onerror="this.style.opacity='.18'" /> <div class="absolute inset-x-3 top-3 flex items-start justify-between gap-2"> <span class="rounded-full bg-white/90 backdrop-blur px-3 py-1.5 text-[10px] font-black shadow-sm">${score}% توافق</span> <span class="rounded-full bg-black/65 text-white backdrop-blur px-3 py-1.5 text-[10px] font-bold">${esc(item.match_type || 'توصية')}</span> </div> </div> <div class="p-4 sm:p-5 flex-1 flex flex-col"> <div class="flex items-center justify-between gap-2"> <span class="text-[11px] text-neutral-400 font-black">${esc(categoryNames[item.category] || item.category)}</span> <span class="text-[11px] text-neutral-400 font-bold">${esc(item.city)}</span> </div> <h4 class="mt-2 text-sm sm:text-base font-black leading-6">${esc(item.title)}</h4> <div class="mt-1 text-xs text-neutral-400 font-bold">${esc(item.merchant_name)}</div> <p class="mt-2 text-xs sm:text-sm text-neutral-500 leading-6">${esc(item.description)}</p> <ul class="mt-3 space-y-1">${reasons}</ul> <div class="mt-3 flex flex-wrap gap-1.5">${tags}</div> <div class="mt-auto pt-4 flex items-end justify-between gap-3"> <div> <div class="text-[10px] text-neutral-400 font-bold">السعر</div> <div class="text-lg font-black">${esc(money(item.price_jod))}</div> </div> <button type="button" onclick='openDeal(${JSON.stringify(item)})' class="min-h-[48px] px-4 rounded-2xl bg-neutral-950 hover:bg-neutral-800 text-white font-black text-xs sm:text-sm transition active:scale-[0.985]"> افتحي الصفقة <span class="opacity-60">(1 دينار)</span> </button> </div> <div class="contact-zone relative mt-4 p-2 rounded-2xl border border-neutral-100 hide-links" data-card="${index}"> <div class="flex gap-2"> <a href="${esc(item.whatsapp_url)}" target="_blank" rel="noopener noreferrer" class="flex-1 text-center rounded-xl bg-emerald-50 text-emerald-700 py-3 text-xs font-black">واتساب المتجر</a> <a href="${esc(item.instagram_url)}" target="_blank" rel="noopener noreferrer" class="flex-1 text-center rounded-xl bg-pink-50 text-pink-700 py-3 text-xs font-black">إنستغرام</a> </div> </div> </div> </article>`;
+}
+
+function openDeal(item) {
+activeCard = item;
+document.getElementById('paidCheck').checked = false;
+dealModal.classList.remove('hidden');
+document.body.classList.add('overflow-hidden');
+}
+function closeDealModal() {
+dealModal.classList.add('hidden');
+document.body.classList.remove('overflow-hidden');
+}
+dealModal.addEventListener('click', (event) => { if (event.target === dealModal) closeDealModal(); });
+document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !dealModal.classList.contains('hidden')) closeDealModal(); });
+function confirmDeal() {
+if (!document.getElementById('paidCheck').checked) {
+alert('الرجاء تأكيد قراءة تعليمات تحويل 1 دينار عبر CliQ إلى البنك العربي — MQRB أولاً.');
+return;
+}
+closeDealModal();
+document.querySelectorAll('.contact-zone').forEach(el => el.classList.remove('hide-links'));
+if (activeCard) alert(`تم تحرير روابط التواصل لمنتج: ${activeCard.title}`);
+}
+
+function setBusy(busy) {
+searchBtn.disabled = busy;
+searchBtn.classList.toggle('opacity-60', busy);
+searchBtn.classList.toggle('cursor-wait', busy);
+loading.classList.toggle('hidden', !busy);
+}
+
+function renderResults(data) {
+renderIntent(data.intent);
+const count = data.results.length;
+resultsTitle.textContent = count ? 'كل العروض التنافسية المطابقة' : 'لم نجد عروضًا مطابقة لهذه الشروط — جرّبي «مش شرط اللون» أو وسّعي الميزانية';
+countBadge.textContent = `${count} ${count === 1 ? 'عرض' : 'عروض'}`;
+countBadge.classList.remove('hidden');
+grid.innerHTML = data.results.map(productCard).join('');
+if (!count) empty.classList.remove('hidden');
+if (count) window.scrollTo({top: grid.offsetTop - 90, behavior: 'smooth'});
+}
+
+function renderError(message) {
+empty.classList.remove('hidden');
+resultsTitle.textContent = 'صار خطأ في البحث';
+empty.innerHTML = `<div class="text-4xl mb-3">!</div><div class="font-black">${esc(message)}</div><div class="text-sm text-neutral-500 mt-2">جربي صياغة أخرى للطلب.</div>`;
+}
+
+form.addEventListener('submit', async (event) => {
+event.preventDefault();
+const query = queryEl.value.trim();
+if (!query) return;
+empty.classList.add('hidden');
+grid.innerHTML = '';
+countBadge.classList.add('hidden');
+resultsTitle.textContent = 'جاري تحليل نيتكِ الشرائية…';
+setBusy(true);
+try {
+const response = await fetch('/api/recommend', {
+method: 'POST', headers: {'Content-Type':'application/json'},
+body: JSON.stringify({query})
+});
+const data = await response.json();
+if (!response.ok) throw new Error(data.error || 'تعذر إتمام البحث');
+sessionId = data.session_id;
+refineForm.classList.remove('hidden');
+renderResults(data);
+} catch (error) {
+renderError(error.message);
+} finally { setBusy(false); }
+});
+
+refineForm.addEventListener('submit', async (event) => {
+event.preventDefault();
+const message = refineInput.value.trim();
+if (!message || !sessionId) return;
+setBusy(true);
+try {
+const response = await fetch('/api/refine', {
+method: 'POST', headers: {'Content-Type':'application/json'},
+body: JSON.stringify({session_id: sessionId, message})
+});
+const data = await response.json();
+if (!response.ok) throw new Error(data.error || 'تعذر تحديث الطلب');
+refineInput.value = '';
+renderResults(data);
+} catch (error) {
+renderError(error.message);
+} finally { setBusy(false); }
+});
+
+queryEl.focus();
+
+
+"""
+STATUS_TEXT = {
+    200: "OK",
+    400: "Bad Request",
+    404: "Not Found",
+    405: "Method Not Allowed",
+    500: "Internal Server Error",
+}
 
 
 def _intent_public(intent: Dict[str, Any]) -> Dict[str, Any]:
@@ -1709,13 +1572,16 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
     try:
         if method == "GET":
             if path in ("/", "/index.html"):
-                page = HTML_TEMPLATE.replace("__PAYMENT_BANK_AR__", html.escape(PAYMENT_BANK_AR))
+                page = HTML_TEMPLATE.replace("**PAYMENT_BANK_AR**", html.escape(PAYMENT_BANK_AR))
                 return 200, headers + [("Content-Type", "text/html; charset=utf-8")], page.encode("utf-8")
             if path == "/healthz":
                 return respond({"status": "ok"})
             if path == "/api/health":
                 return respond({
-                    "ok": True, "service": "التوصية", "version": "2.0", "port": PORT,
+                    "ok": True,
+                    "service": "التوصية",
+                    "version": "2.0",
+                    "port": PORT,
                     "inventory_count": len(SEED_OFFERS),
                     "gemini_enabled": bool(gemini_model()),
                     "timestamp": int(time.time()),
@@ -1793,7 +1659,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 length = 0
             if length > 0:
                 body = self.rfile.read(min(length, 128 * 1024))
-        status, headers, payload = route_request(method, path, body, self.client_address[0] if self.client_address else "")
+        status, headers, payload = route_request(
+            method,
+            path,
+            body,
+            self.client_address[0] if self.client_address else "",
+        )
         self.send_response(status)
         for key, value in headers:
             self.send_header(key, value)
@@ -1809,8 +1680,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------------------
-# WSGI entrypoint for gunicorn:  gunicorn app:application
+# WSGI entrypoint for gunicorn: gunicorn app:application
 # ---------------------------------------------------------------------------
+
 
 def application(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
     method = environ.get("REQUEST_METHOD", "GET").upper()
@@ -1821,7 +1693,10 @@ def application(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
         length = 0
     body = environ["wsgi.input"].read(min(length, 128 * 1024)) if length > 0 else b""
     status, headers, payload = route_request(method, path, body, environ.get("REMOTE_ADDR", ""))
-    start_response(f"{status} {STATUS_TEXT.get(status, 'OK')}", headers + [("Content-Length", str(len(payload)))])
+    start_response(
+        f"{status} {STATUS_TEXT.get(status, 'OK')}",
+        headers + [("Content-Length", str(len(payload)))],
+    )
     return [payload]
 
 
@@ -1838,15 +1713,9 @@ def main() -> None:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         LOGGER.info("Stopping server")
-      finally:
+    finally:
         server.server_close()
 
-init_db() # آمن ومتكرر CREATE IF NOT EXISTS + INSERT OR IGNORE - لا حذف إطلاقاً
 
 if __name__ == "__main__":
-    import os
-    # سحب المنفذ ديناميكياً من السيرفر وإجبار النظام على وضعه في البيئة التشغيلية
-    port = os.environ.get("PORT", "8000")
-    os.environ["PORT"] = port
-    
     main()
