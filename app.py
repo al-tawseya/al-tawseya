@@ -1213,10 +1213,10 @@ def main() -> None:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         LOGGER.info("Stopping server")
-    finally:
-        server.server_close()
-
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer((HOST, PORT), AppHandler)
+    # حقن المنفذ السحابي الصريح لـ Render لتجاوز فحص الـ Port Scan بنجاح
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), EnterpriseWebHandler)
+    print(f"🚀 Live Server Running Perfectly on Port {port}")
     server.serve_forever()
