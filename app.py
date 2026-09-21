@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hmac
 import json
 import logging
 import os
@@ -38,8 +39,9 @@ DB_LOCK = threading.RLock()
 
 PAYMENT_BANK = "Arab Bank"
 PAYMENT_BANK_AR = "البنك العربي"
-PAYMENT_ALIAS = "MQRB"
-DEAL_PRICE_JOD = 1
+PAYMENT_ALIAS = os.getenv("PAYMENT_ALIAS", "MQRB").strip()
+DEAL_PRICE_JOD = float(os.getenv("DEAL_PRICE_JOD", "1"))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -904,6 +906,22 @@ created_at TEXT DEFAULT CURRENT_TIMESTAMP,
 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS deal_access (
+deal_id TEXT PRIMARY KEY,
+session_id TEXT NOT NULL,
+offer_id INTEGER NOT NULL,
+status TEXT NOT NULL DEFAULT 'pending_payment',
+transaction_ref TEXT,
+created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+submitted_at TEXT,
+approved_at TEXT,
+approved_by TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_deal_access_session ON deal_access(session_id);
+CREATE INDEX IF NOT EXISTS idx_deal_access_offer ON deal_access(offer_id);
+CREATE INDEX IF NOT EXISTS idx_deal_access_status ON deal_access(status);
+
 CREATE INDEX IF NOT EXISTS idx_offers_category ON merchant_offers(category);
 CREATE INDEX IF NOT EXISTS idx_offers_price ON merchant_offers(price_jod);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
@@ -1031,6 +1049,221 @@ def get_session_intent(session_id: str) -> Optional[Dict[str, Any]]:
             return None
     finally:
         conn.close()
+
+
+def get_offer_by_id(offer_id: int) -> Optional[Offer]:
+    ensure_db()
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM merchant_offers WHERE id = ?", (offer_id,)).fetchone()
+        if not row:
+            return None
+        return Offer(
+            id=row["id"], merchant_name=row["merchant_name"], title=row["title"],
+            category=row["category"], price_jod=row["price_jod"],
+            tags=read_json_list(row["tags"]), colors=read_json_list(row["colors"]),
+            style=read_json_list(row["style"]), city=row["city"],
+            description=row["description"], image_url=row["image_url"],
+            whatsapp_url=row["whatsapp_url"], instagram_url=row["instagram_url"],
+            sizes=read_json_list(row["sizes"]) if "sizes" in row.keys() else [],
+            size_system=row["size_system"] if "size_system" in row.keys() else "",
+        )
+    finally:
+        conn.close()
+
+
+def get_deal(deal_id: str) -> Optional[sqlite3.Row]:
+    ensure_db()
+    conn = get_connection()
+    try:
+        return conn.execute(
+            "SELECT * FROM deal_access WHERE deal_id = ?",
+            (deal_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def create_or_get_deal(session_id: str, offer_id: int) -> Optional[Dict[str, Any]]:
+    intent = get_session_intent(session_id)
+    if intent is None:
+        return None
+    recommended_ids = {int(item["id"]) for item in recommend(intent)}
+    if offer_id not in recommended_ids:
+        return None
+
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            existing = conn.execute(
+                """SELECT * FROM deal_access
+                   WHERE session_id = ? AND offer_id = ?
+                   ORDER BY created_at DESC LIMIT 1""",
+                (session_id, offer_id),
+            ).fetchone()
+            if existing and existing["status"] in {"pending_payment", "payment_submitted", "paid"}:
+                return dict(existing)
+
+            deal_id = uuid.uuid4().hex
+            conn.execute(
+                """INSERT INTO deal_access
+                   (deal_id, session_id, offer_id, status)
+                   VALUES (?, ?, ?, 'pending_payment')""",
+                (deal_id, session_id, offer_id),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM deal_access WHERE deal_id = ?", (deal_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def submit_deal_payment(deal_id: str, session_id: str, transaction_ref: str) -> Optional[Dict[str, Any]]:
+    transaction_ref = transaction_ref.strip()[:160]
+    if not transaction_ref:
+        return None
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM deal_access WHERE deal_id = ? AND session_id = ?",
+                (deal_id, session_id),
+            ).fetchone()
+            if not row:
+                return None
+            if row["status"] == "paid":
+                return dict(row)
+            conn.execute(
+                """UPDATE deal_access
+                   SET status = 'payment_submitted', transaction_ref = ?, submitted_at = CURRENT_TIMESTAMP
+                   WHERE deal_id = ? AND session_id = ?""",
+                (transaction_ref, deal_id, session_id),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM deal_access WHERE deal_id = ?", (deal_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def deal_status_for_session(deal_id: str, session_id: str) -> Optional[Dict[str, Any]]:
+    row = get_deal(deal_id)
+    if not row or row["session_id"] != session_id:
+        return None
+    return dict(row)
+
+
+def set_deal_status(deal_id: str, status: str) -> bool:
+    if status not in {"paid", "rejected"}:
+        return False
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            row = conn.execute("SELECT deal_id FROM deal_access WHERE deal_id = ?", (deal_id,)).fetchone()
+            if not row:
+                return False
+            if status == "paid":
+                conn.execute(
+                    """UPDATE deal_access
+                       SET status = 'paid', approved_at = CURRENT_TIMESTAMP, approved_by = 'admin'
+                       WHERE deal_id = ?""",
+                    (deal_id,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE deal_access SET status = 'rejected' WHERE deal_id = ?",
+                    (deal_id,),
+                )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+
+def list_pending_deals() -> List[Dict[str, Any]]:
+    ensure_db()
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT d.*, m.merchant_name, m.title, m.price_jod
+               FROM deal_access d
+               LEFT JOIN merchant_offers m ON m.id = d.offer_id
+               WHERE d.status = 'payment_submitted'
+               ORDER BY d.submitted_at DESC, d.created_at DESC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def update_offer_links(offer_id: int, whatsapp_url: str, instagram_url: str, image_url: str) -> bool:
+    def clean_url(value: str, label: str) -> str:
+        value = value.strip()[:2000]
+        if not value:
+            return ""
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(f"{label} يجب أن يكون رابطًا يبدأ بـ https://")
+        return value
+
+    whatsapp_url = clean_url(whatsapp_url, "رابط واتساب")
+    instagram_url = clean_url(instagram_url, "رابط إنستغرام")
+    image_url = clean_url(image_url, "رابط الصورة")
+
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            cur = conn.execute(
+                """UPDATE merchant_offers
+                   SET whatsapp_url = ?, instagram_url = ?, image_url = ?
+                   WHERE id = ?""",
+                (whatsapp_url, instagram_url, image_url, offer_id),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
+
+def list_admin_offers() -> List[Dict[str, Any]]:
+    ensure_db()
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT id, merchant_name, title, price_jod, whatsapp_url, instagram_url, image_url
+               FROM merchant_offers ORDER BY id ASC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _admin_ok(password: str) -> bool:
+    return bool(ADMIN_PASSWORD) and hmac.compare_digest(password, ADMIN_PASSWORD)
+
+
+def _admin_page() -> str:
+    return r"""
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>إدارة التوصية</title><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-neutral-100 text-neutral-900"><main class="max-w-6xl mx-auto p-4 sm:p-8">
+<div class="flex items-center justify-between gap-4 mb-6"><div><h1 class="text-3xl font-black">لوحة إدارة التوصية</h1><p class="text-sm text-neutral-500 mt-1">تأكيد المدفوعات وإدارة روابط الإعلانات.</p></div><a href="/" class="rounded-xl bg-white px-4 py-2 font-black border">الموقع</a></div>
+<div id="loginBox" class="bg-white rounded-3xl p-5 border shadow-sm"><div class="font-black text-lg">تسجيل دخول الإدارة</div><p class="text-sm text-neutral-500 mt-1">كلمة المرور هي <span class="font-black">ADMIN_PASSWORD</span> الموجودة في Render.</p><div class="mt-4 flex gap-2"><input id="adminPassword" type="password" class="flex-1 rounded-xl bg-neutral-100 px-4 py-3 outline-none" placeholder="كلمة مرور الإدارة"><button onclick="login()" class="rounded-xl bg-neutral-950 text-white px-5 font-black">دخول</button></div><div id="loginMsg" class="text-sm mt-3"></div></div>
+<div id="panel" class="hidden">
+<section class="mt-6 bg-white rounded-3xl p-5 border shadow-sm"><div class="flex items-center justify-between gap-3"><div><h2 class="text-xl font-black">طلبات الدفع</h2><p class="text-sm text-neutral-500">تحققي من التحويل البنكي في حسابك ثم اضغطي «تم الدفع».</p></div><button onclick="loadAll()" class="rounded-xl bg-neutral-100 px-4 py-2 font-black">تحديث</button></div><div id="deals" class="mt-4 space-y-3"></div></section>
+<section class="mt-6 bg-white rounded-3xl p-5 border shadow-sm"><div><h2 class="text-xl font-black">روابط الإعلانات</h2><p class="text-sm text-neutral-500">أضيفي روابط واتساب وإنستغرام والصورة الحقيقية لكل إعلان. لا ترسلي كلمات مرور أو أسرار هنا.</p></div><div id="offers" class="mt-4 space-y-4"></div></section>
+</div></main>
+<script>
+let password='';
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw new Error(d.error||'حدث خطأ');return d;}
+async function login(){const p=document.getElementById('adminPassword').value;if(!p)return;try{await api('/api/admin/login',{password:p});password=p;document.getElementById('loginBox').classList.add('hidden');document.getElementById('panel').classList.remove('hidden');loadAll();}catch(e){document.getElementById('loginMsg').textContent=e.message;document.getElementById('loginMsg').className='text-sm mt-3 text-red-600 font-bold';}}
+async function loadDeals(){const d=await api('/api/admin/pending',{password});const box=document.getElementById('deals');if(!d.deals.length){box.innerHTML='<div class="rounded-2xl bg-neutral-50 p-5 text-sm text-neutral-500">لا توجد طلبات دفع معلقة.</div>';return;}box.innerHTML=d.deals.map(x=>`<article class="rounded-2xl border p-4"><div class="font-black">${esc(x.title)} — ${esc(x.merchant_name)}</div><div class="text-sm text-neutral-500 mt-1">Deal: ${esc(x.deal_id)} · العرض ${esc(x.offer_id)} · المرجع: <span class="font-black text-neutral-900">${esc(x.transaction_ref)}</span></div><div class="text-xs text-neutral-400 mt-1">وقت الإرسال: ${esc(x.submitted_at||x.created_at)}</div><div class="mt-3 flex gap-2"><button onclick="decide('${esc(x.deal_id)}','paid')" class="rounded-xl bg-emerald-600 text-white px-4 py-2 font-black">تم الدفع</button><button onclick="decide('${esc(x.deal_id)}','rejected')" class="rounded-xl bg-red-50 text-red-700 px-4 py-2 font-black">رفض</button></div></article>`).join('');}
+async function decide(id,action){try{await api('/api/admin/decision',{password,deal_id:id,action});loadDeals();}catch(e){alert(e.message);}}
+async function loadOffers(){const d=await api('/api/admin/offers',{password});document.getElementById('offers').innerHTML=d.offers.map(x=>`<article class="rounded-2xl border p-4"><div class="font-black">#${x.id} — ${esc(x.merchant_name)} — ${esc(x.title)}</div><div class="grid md:grid-cols-3 gap-2 mt-3"><input data-id="${x.id}" data-field="whatsapp_url" value="${esc(x.whatsapp_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="رابط واتساب"><input data-id="${x.id}" data-field="instagram_url" value="${esc(x.instagram_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="رابط إنستغرام"><input data-id="${x.id}" data-field="image_url" value="${esc(x.image_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="رابط الصورة"><button onclick="saveOffer(${x.id})" class="rounded-xl bg-neutral-950 text-white px-4 py-3 font-black md:col-span-3">حفظ روابط الإعلان</button></div></article>`).join('');}
+async function saveOffer(id){const get=f=>document.querySelector(`[data-id="${id}"][data-field="${f}"]`).value;try{await api('/api/admin/offer-update',{password,offer_id:id,whatsapp_url:get('whatsapp_url'),instagram_url:get('instagram_url'),image_url:get('image_url')});alert('تم حفظ الروابط');}catch(e){alert(e.message);}}
+async function loadAll(){try{await Promise.all([loadDeals(),loadOffers()]);}catch(e){alert(e.message);}}
+</script></body></html>
+"""
 
 
 def read_json_list(raw: Any) -> List[str]:
@@ -1227,6 +1460,8 @@ def recommend(intent: Dict[str, Any]) -> List[Dict[str, Any]]:
         if score < 0:
             continue
         payload = asdict(offer)
+        payload.pop("whatsapp_url", None)
+        payload.pop("instagram_url", None)
         payload["category_label"] = CATEGORY_LABELS.get(offer.category, offer.category)
         payload["score"] = score
         payload["reasons"] = reasons
@@ -1261,7 +1496,7 @@ class MockCliqProvider(PaymentProvider):
             "target_bank": PAYMENT_BANK_AR,
             "alias": PAYMENT_ALIAS,
             "auto_verify": False,
-            "note": "التحويل يدوي عبر CliQ؛ التأكيد في الواجهة يحرر الروابط فقط.",
+            "note": "التحويل يدوي عبر CliQ؛ لا يتم فتح روابط المتجر إلا بعد مراجعة التحويل من لوحة الإدارة.",
         }
 
     def verify(self, session_id: str) -> bool:
@@ -1286,7 +1521,7 @@ HTML_TEMPLATE = r"""
     .soft-shadow { box-shadow: 0 1px 0 rgba(17,24,39,.04), 0 16px 50px rgba(17,24,39,.055); }
     .hide-links a { filter: blur(6px); pointer-events: none; user-select: none; }
     .hide-links::after {
-      content: '🔒 التواصل مع التاجر يظهر بعد تأكيد قراءة تعليمات دفع 1 دينار عبر CliQ';
+      content: '🔒 روابط المتجر تظهر بعد التحقق من تحويل 1 دينار عبر CliQ';
       position: absolute; inset: 0; display:flex; align-items:center; justify-content:center;
       padding: 1rem; border-radius: 1.25rem; background: rgba(255,255,255,.90);
       color: #171717; font-size:.78rem; font-weight:800; text-align:center;
@@ -1384,33 +1619,36 @@ HTML_TEMPLATE = r"""
       <div class="flex items-start justify-between gap-4">
         <div>
           <div class="text-[11px] font-black tracking-widest text-neutral-400">DEAL ACCESS</div>
-          <h3 class="mt-1 text-2xl font-black">افتحي الصفقة بقيمة 1 دينار</h3>
+          <h3 class="mt-1 text-2xl font-black">فتح هذا الإعلان مقابل 1 دينار</h3>
         </div>
         <button type="button" onclick="closeDealModal()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black text-lg">×</button>
       </div>
       <div class="mt-5 rounded-2xl bg-neutral-50 border border-neutral-200 p-4 text-sm leading-7">
-        <div class="font-black">⚡ دفع CliQ محلي</div>
-        <p class="mt-1 text-neutral-600">لإظهار روابط التواصل المباشرة للمتجر، استخدمي الدفع المحلي بقيمة 1 دينار أردني فقط عبر نظام CliQ.</p>
+        <div class="font-black">⚡ الدفع عبر CliQ</div>
+        <p class="mt-1 text-neutral-600">حوّلي 1 دينار إلى الحساب التالي، ثم أدخلي رقم/مرجع الحركة. لن تظهر روابط المتجر إلا بعد أن يتم التحقق من التحويل من لوحة الإدارة.</p>
       </div>
       <div class="grid grid-cols-2 gap-3 mt-4">
         <div class="rounded-2xl bg-white border border-neutral-200 p-4">
           <div class="text-[10px] text-neutral-400 font-black">البنك المستهدف</div>
-          <div class="mt-1 font-black text-sm">**PAYMENT_BANK_AR** (Arab Bank)</div>
+          <div class="mt-1 font-black text-sm">البنك العربي (Arab Bank)</div>
         </div>
         <div class="rounded-2xl bg-white border border-neutral-200 p-4">
-          <div class="text-[10px] text-neutral-400 font-black">Alias ID / Username</div>
+          <div class="text-[10px] text-neutral-400 font-black">CliQ Alias</div>
           <div class="mt-1 font-black text-sm tracking-widest">MQRB</div>
         </div>
       </div>
-      <label class="mt-5 flex items-start gap-3 rounded-2xl border border-neutral-200 p-4 cursor-pointer">
-        <input id="paidCheck" type="checkbox" class="mt-1 w-5 h-5" />
-        <span class="text-sm font-black leading-6">أؤكد التعليمات وأظهر التواصل ✦</span>
+      <div id="dealTitle" class="mt-4 rounded-2xl border border-neutral-200 p-4 text-sm font-black"></div>
+      <label class="block mt-4">
+        <span class="text-xs font-black text-neutral-500">رقم/مرجع التحويل</span>
+        <input id="transactionRef" maxlength="160" class="mt-2 w-full rounded-2xl bg-neutral-100 px-4 py-3 outline-none focus:ring-2 focus:ring-neutral-900 text-sm font-bold" placeholder="مثال: 123456789">
       </label>
-      <button type="button" onclick="confirmDeal()" class="mt-4 w-full min-h-[52px] rounded-2xl bg-neutral-950 hover:bg-neutral-800 text-white font-black">تأكيد وإظهار روابط المتجر</button>
-      <div class="mt-3 text-[11px] text-neutral-400 leading-5">هذه الشاشة لا تتحقق من التحويل البنكي تلقائياً؛ التأكيد هنا يحرر الروابط في الواجهة فقط.</div>
+      <button type="button" onclick="submitPayment()" id="submitPaymentBtn" class="mt-4 w-full min-h-[52px] rounded-2xl bg-neutral-950 hover:bg-neutral-800 text-white font-black">أرسلت التحويل — أرسل طلب التحقق</button>
+      <button type="button" onclick="refreshDeal()" id="refreshDealBtn" class="mt-2 w-full min-h-[46px] rounded-2xl bg-neutral-100 hover:bg-neutral-200 font-black">تحديث حالة الطلب</button>
+      <div id="dealStatus" class="mt-3 rounded-2xl bg-neutral-50 p-4 text-sm leading-6 text-neutral-600">لم يتم إرسال طلب التحقق بعد.</div>
+      <div id="dealLinks" class="hidden mt-3 grid grid-cols-2 gap-2"></div>
+      <div class="mt-3 text-[11px] text-neutral-400 leading-5">لا يوجد اعتماد على مربع «أؤكد أنني دفعت». التفعيل يتم من الخادم فقط بعد مراجعة التحويل.</div>
     </div>
   </div>
-
   <script>
 const form = document.getElementById('searchForm');
 const refineForm = document.getElementById('refineForm');
@@ -1425,6 +1663,9 @@ const countBadge = document.getElementById('countBadge');
 const intentPills = document.getElementById('intentPills');
 const dealModal = document.getElementById('dealModal');
 let activeCard = null;
+let activeDealId = null;
+let dealPoll = null;
+let paidDeals = {};
 let sessionId = null;
 
 const EX = [
@@ -1450,13 +1691,9 @@ const items = [];
 (intent.excluded_colors || []).forEach(c => items.push(`<span class="rounded-xl bg-red-50 border border-red-100 px-3 py-1.5 text-xs font-bold text-red-500">🚫 بدون ${esc(c)}</span>`));
 (intent.styles || []).forEach(c => items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-bold text-neutral-600">✦ ${esc(c)}</span>`));
 const b = intent.budget || {};
-if (b.amount !== null && b.amount !== undefined) {
-items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">💰 ${esc(budgetLabels[b.kind] || 'حتى')} ${esc(money(b.amount))}</span>`);
-} else if (b.kind === 'cheapest') {
-items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">💰 بدي الأرخص</span>`);
-} else if (b.kind === 'quality_first') {
-items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">✨ الجودة أهم من السعر</span>`);
-}
+if (b.amount !== null && b.amount !== undefined) items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">💰 ${esc(budgetLabels[b.kind] || 'حتى')} ${esc(money(b.amount))}</span>`);
+else if (b.kind === 'cheapest') items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">💰 بدي الأرخص</span>`);
+else if (b.kind === 'quality_first') items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">✨ الجودة أهم من السعر</span>`);
 const s = intent.sizes || {};
 if (s.system === 'bra') items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">📏 مقاس ${esc(s.band)}${esc(s.cup)}</span>`);
 else if (s.system === 'shoe_eu') items.push(`<span class="rounded-xl bg-white border border-neutral-200 px-3 py-1.5 text-xs font-black text-neutral-600">📏 مقاس ${esc(s.value)} أوروبي</span>`);
@@ -1464,35 +1701,76 @@ else if (s.system && s.value) items.push(`<span class="rounded-xl bg-white borde
 intentPills.innerHTML = items.join('');
 }
 
+function protectedButtons(dealId) {
+return `<button type="button" onclick="openProtectedLink('${esc(dealId)}','whatsapp')" class="flex-1 text-center rounded-xl bg-emerald-50 text-emerald-700 py-3 text-xs font-black">واتساب المتجر</button><button type="button" onclick="openProtectedLink('${esc(dealId)}','instagram')" class="flex-1 text-center rounded-xl bg-pink-50 text-pink-700 py-3 text-xs font-black">إنستغرام</button>`;
+}
+function lockedZone() {
+return `<div class="flex gap-2"><div class="flex-1 text-center rounded-xl bg-neutral-100 text-neutral-500 py-3 text-[11px] font-black">🔒 الدفع والتحقق مطلوبان</div></div>`;
+}
+function unlockCard(offerId, dealId) {
+paidDeals[String(offerId)] = dealId;
+const card = grid.querySelector(`[data-offer-id="${offerId}"]`);
+if (!card) return;
+const zone = card.querySelector('.contact-zone');
+if (!zone) return;
+zone.classList.remove('hide-links');
+zone.innerHTML = `<div class="flex gap-2">${protectedButtons(dealId)}</div>`;
+}
 function productCard(item, index) {
 const score = Math.round(Number(item.score || 0));
 const tags = (item.tags || []).slice(0, 5).map(tag => `<span class="rounded-full bg-neutral-100 px-2 py-1 text-[10px] font-bold text-neutral-500">${esc(tag)}</span>`).join('');
-const reasons = (item.reasons || []).slice(0, 3).map(r =>
-`<li class="flex items-start gap-1.5 text-[11px] text-emerald-700 font-bold leading-5"><span class="mt-0.5">✓</span><span>${esc(r)}</span></li>`).join('');
-return ` <article class="group bg-white rounded-[2rem] border border-neutral-200/70 overflow-hidden soft-shadow flex flex-col"> <div class="relative aspect-[4/5] overflow-hidden bg-neutral-100"> <img src="${esc(item.image_url)}" loading="lazy" referrerpolicy="no-referrer" class="h-full w-full object-cover transition duration-700 group-hover:scale-[1.03]" alt="${esc(item.title)}" onerror="this.style.opacity='.18'" /> <div class="absolute inset-x-3 top-3 flex items-start justify-between gap-2"> <span class="rounded-full bg-white/90 backdrop-blur px-3 py-1.5 text-[10px] font-black shadow-sm">${score}% توافق</span> <span class="rounded-full bg-black/65 text-white backdrop-blur px-3 py-1.5 text-[10px] font-bold">${esc(item.match_type || 'توصية')}</span> </div> </div> <div class="p-4 sm:p-5 flex-1 flex flex-col"> <div class="flex items-center justify-between gap-2"> <span class="text-[11px] text-neutral-400 font-black">${esc(categoryNames[item.category] || item.category)}</span> <span class="text-[11px] text-neutral-400 font-bold">${esc(item.city)}</span> </div> <h4 class="mt-2 text-sm sm:text-base font-black leading-6">${esc(item.title)}</h4> <div class="mt-1 text-xs text-neutral-400 font-bold">${esc(item.merchant_name)}</div> <p class="mt-2 text-xs sm:text-sm text-neutral-500 leading-6">${esc(item.description)}</p> <ul class="mt-3 space-y-1">${reasons}</ul> <div class="mt-3 flex flex-wrap gap-1.5">${tags}</div> <div class="mt-auto pt-4 flex items-end justify-between gap-3"> <div> <div class="text-[10px] text-neutral-400 font-bold">السعر</div> <div class="text-lg font-black">${esc(money(item.price_jod))}</div> </div> <button type="button" onclick='openDeal(${JSON.stringify(item)})' class="min-h-[48px] px-4 rounded-2xl bg-neutral-950 hover:bg-neutral-800 text-white font-black text-xs sm:text-sm transition active:scale-[0.985]"> افتحي الصفقة <span class="opacity-60">(1 دينار)</span> </button> </div> <div class="contact-zone relative mt-4 p-2 rounded-2xl border border-neutral-100 hide-links" data-card="${index}"> <div class="flex gap-2"> <a href="${esc(item.whatsapp_url)}" target="_blank" rel="noopener noreferrer" class="flex-1 text-center rounded-xl bg-emerald-50 text-emerald-700 py-3 text-xs font-black">واتساب المتجر</a> <a href="${esc(item.instagram_url)}" target="_blank" rel="noopener noreferrer" class="flex-1 text-center rounded-xl bg-pink-50 text-pink-700 py-3 text-xs font-black">إنستغرام</a> </div> </div> </div> </article>`;
+const reasons = (item.reasons || []).slice(0, 3).map(r => `<li class="flex items-start gap-1.5 text-[11px] text-emerald-700 font-bold leading-5"><span class="mt-0.5">✓</span><span>${esc(r)}</span></li>`).join('');
+const knownDeal = paidDeals[String(item.id)];
+const zone = knownDeal ? `<div class="flex gap-2">${protectedButtons(knownDeal)}</div>` : lockedZone();
+return ` <article data-offer-id="${item.id}" class="group bg-white rounded-[2rem] border border-neutral-200/70 overflow-hidden soft-shadow flex flex-col"><div class="relative aspect-[4/5] overflow-hidden bg-neutral-100"><img src="${esc(item.image_url)}" loading="lazy" referrerpolicy="no-referrer" class="h-full w-full object-cover transition duration-700 group-hover:scale-[1.03]" alt="${esc(item.title)}" onerror="this.style.opacity='.18'" /><div class="absolute inset-x-3 top-3 flex items-start justify-between gap-2"><span class="rounded-full bg-white/90 backdrop-blur px-3 py-1.5 text-[10px] font-black shadow-sm">${score}% توافق</span><span class="rounded-full bg-black/65 text-white backdrop-blur px-3 py-1.5 text-[10px] font-bold">${esc(item.match_type || 'توصية')}</span></div></div><div class="p-4 sm:p-5 flex-1 flex flex-col"><div class="flex items-center justify-between gap-2"><span class="text-[11px] text-neutral-400 font-black">${esc(categoryNames[item.category] || item.category)}</span><span class="text-[11px] text-neutral-400 font-bold">${esc(item.city)}</span></div><h4 class="mt-2 text-sm sm:text-base font-black leading-6">${esc(item.title)}</h4><div class="mt-1 text-xs text-neutral-400 font-bold">${esc(item.merchant_name)}</div><p class="mt-2 text-xs sm:text-sm text-neutral-500 leading-6">${esc(item.description)}</p><ul class="mt-3 space-y-1">${reasons}</ul><div class="mt-3 flex flex-wrap gap-1.5">${tags}</div><div class="mt-auto pt-4 flex items-end justify-between gap-3"><div><div class="text-[10px] text-neutral-400 font-bold">السعر</div><div class="text-lg font-black">${esc(money(item.price_jod))}</div></div><button type="button" onclick='openDeal(${JSON.stringify({id:item.id,title:item.title,price_jod:item.price_jod})})' class="min-h-[48px] px-4 rounded-2xl bg-neutral-950 hover:bg-neutral-800 text-white font-black text-xs sm:text-sm transition active:scale-[0.985]">${knownDeal ? 'فتح الإعلان' : 'افتحي الصفقة'} <span class="opacity-60">(1 دينار)</span></button></div><div class="contact-zone relative mt-4 p-2 rounded-2xl border border-neutral-100 ${knownDeal ? '' : 'hide-links'}" data-card="${index}">${zone}</div></div></article>`;
 }
 
-function openDeal(item) {
+async function openDeal(item) {
+if (!sessionId) { alert('أرسلي طلب البحث أولاً.'); return; }
 activeCard = item;
-document.getElementById('paidCheck').checked = false;
+activeDealId = null;
+document.getElementById('transactionRef').value = '';
+document.getElementById('dealTitle').textContent = item.title || '';
+document.getElementById('dealStatus').textContent = 'جاري تجهيز طلب الدفع…';
+document.getElementById('dealLinks').classList.add('hidden');
+document.getElementById('submitPaymentBtn').disabled = true;
+document.getElementById('transactionRef').disabled = true;
 dealModal.classList.remove('hidden');
 document.body.classList.add('overflow-hidden');
+try {
+const response = await fetch('/api/deal/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,offer_id:Number(item.id)})});
+const data = await response.json();
+if(!response.ok) throw new Error(data.error || 'تعذر إنشاء طلب الدفع');
+activeDealId = data.deal_id;
+showDealStatus(data);
+} catch(e) {
+document.getElementById('dealStatus').textContent = e.message;
 }
-function closeDealModal() {
-dealModal.classList.add('hidden');
-document.body.classList.remove('overflow-hidden');
 }
-dealModal.addEventListener('click', (event) => { if (event.target === dealModal) closeDealModal(); });
-document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !dealModal.classList.contains('hidden')) closeDealModal(); });
-function confirmDeal() {
-if (!document.getElementById('paidCheck').checked) {
-alert('الرجاء تأكيد قراءة تعليمات تحويل 1 دينار عبر CliQ إلى البنك العربي — MQRB أولاً.');
-return;
+function showDealStatus(data){
+const status = data.status;
+if(status === 'paid') { unlockCard(activeCard.id, activeDealId); document.getElementById('dealStatus').innerHTML='<span class="text-emerald-700 font-black">تم التحقق من الدفع. روابط هذا الإعلان أصبحت متاحة.</span>'; document.getElementById('submitPaymentBtn').classList.add('hidden'); document.getElementById('refreshDealBtn').classList.add('hidden'); return; }
+if(status === 'payment_submitted') { document.getElementById('dealStatus').innerHTML='<span class="font-black">تم إرسال طلب التحقق.</span><br>بعد مراجعة التحويل من لوحة الإدارة سيظهر رابطا التواصل لهذا الإعلان فقط.'; startDealPolling(); return; }
+document.getElementById('dealStatus').textContent='حوّلي 1 دينار أولاً ثم اكتبي رقم/مرجع الحركة وأرسلي طلب التحقق.';
+document.getElementById('submitPaymentBtn').disabled=false;
+document.getElementById('transactionRef').disabled=false;
 }
-closeDealModal();
-document.querySelectorAll('.contact-zone').forEach(el => el.classList.remove('hide-links'));
-if (activeCard) alert(`تم تحرير روابط التواصل لمنتج: ${activeCard.title}`);
-}
+async function submitPayment(){
+if(!activeDealId || !sessionId) return;
+const ref=document.getElementById('transactionRef').value.trim();
+if(!ref){alert('اكتبي رقم/مرجع التحويل.');return;}
+document.getElementById('submitPaymentBtn').disabled=true;
+try{const r=await fetch('/api/deal/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,deal_id:activeDealId,transaction_ref:ref})});const d=await r.json();if(!r.ok)throw new Error(d.error||'تعذر إرسال الطلب');showDealStatus(d);}catch(e){document.getElementById('dealStatus').textContent=e.message;document.getElementById('submitPaymentBtn').disabled=false;}}
+async function refreshDeal(){if(!activeDealId||!sessionId)return;try{const r=await fetch(`/api/deal/status?session_id=${encodeURIComponent(sessionId)}&deal_id=${encodeURIComponent(activeDealId)}`);const d=await r.json();if(!r.ok)throw new Error(d.error||'تعذر قراءة الحالة');showDealStatus(d);if(d.status==='paid') stopDealPolling();}catch(e){document.getElementById('dealStatus').textContent=e.message;}}
+function startDealPolling(){stopDealPolling();let attempts=0;dealPoll=setInterval(async()=>{attempts+=1;await refreshDeal();if(attempts>=60)stopDealPolling();},5000);}
+function stopDealPolling(){if(dealPoll){clearInterval(dealPoll);dealPoll=null;}}
+async function openProtectedLink(dealId, channel){
+if(!sessionId) return;
+try{const r=await fetch('/api/deal/open',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,deal_id:dealId,channel})});const d=await r.json();if(!r.ok)throw new Error(d.error||'هذا الرابط غير متاح');window.open(d.url,'_blank','noopener');}catch(e){alert(e.message);}}
+function closeDealModal(){stopDealPolling();dealModal.classList.add('hidden');document.body.classList.remove('overflow-hidden');}
+dealModal.addEventListener('click',(event)=>{if(event.target===dealModal)closeDealModal();});
+document.addEventListener('keydown',(event)=>{if(event.key==='Escape'&&!dealModal.classList.contains('hidden'))closeDealModal();});
+
 
 function setBusy(busy) {
 searchBtn.disabled = busy;
@@ -1534,6 +1812,7 @@ body: JSON.stringify({query})
 });
 const data = await response.json();
 if (!response.ok) throw new Error(data.error || 'تعذر إتمام البحث');
+paidDeals = {};
 sessionId = data.session_id;
 refineForm.classList.remove('hidden');
 renderResults(data);
@@ -1570,6 +1849,9 @@ queryEl.focus();
 STATUS_TEXT = {
     200: "OK",
     400: "Bad Request",
+    401: "Unauthorized",
+    402: "Payment Required",
+    403: "Forbidden",
     404: "Not Found",
     405: "Method Not Allowed",
     500: "Internal Server Error",
@@ -1599,6 +1881,19 @@ def _recommend_payload(intent: Dict[str, Any], request_id: str, session_id: str)
     }
 
 
+def _deal_response(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "deal_id": row["deal_id"],
+        "offer_id": int(row["offer_id"]),
+        "status": row["status"],
+        "submitted_at": row.get("submitted_at"),
+        "payment": PAYMENT_PROVIDER.instructions(),
+    }
+
+
+ADMIN_HTML_CONTENT_TYPE = "text/html; charset=utf-8"
+
 def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> Tuple[int, List[Tuple[str, str]], bytes]:
     headers: List[Tuple[str, str]] = [
         ("X-Content-Type-Options", "nosniff"),
@@ -1613,8 +1908,19 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
 
     try:
         if method == "GET":
+            if path == "/admin":
+                return 200, headers + [("Content-Type", ADMIN_HTML_CONTENT_TYPE)], _admin_page().encode("utf-8")
+            if path.startswith("/api/deal/status"):
+                parsed = urlparse(path)
+                params = dict(item.split("=", 1) for item in parsed.query.split("&") if "=" in item)
+                session_id = params.get("session_id", "")
+                deal_id = params.get("deal_id", "")
+                row = deal_status_for_session(deal_id, session_id)
+                if not row:
+                    return respond({"error": "طلب الدفع غير موجود."}, 404)
+                return respond(_deal_response(row))
             if path in ("/", "/index.html"):
-                page = HTML_TEMPLATE.replace("**PAYMENT_BANK_AR**", html.escape(PAYMENT_BANK_AR))
+                page = HTML_TEMPLATE.replace("البنك العربي", html.escape(PAYMENT_BANK_AR))
                 return 200, headers + [("Content-Type", "text/html; charset=utf-8")], page.encode("utf-8")
             if path == "/healthz":
                 return respond({"status": "ok"})
@@ -1639,6 +1945,94 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 return respond({"error": "JSON غير صالح"}, 400)
             if not isinstance(data, dict):
                 return respond({"error": "تنسيق الطلب غير صالح"}, 400)
+
+            if path == "/api/admin/login":
+                password = str(data.get("password", ""))
+                if not _admin_ok(password):
+                    return respond({"error": "كلمة مرور الإدارة غير صحيحة."}, 401)
+                return respond({"ok": True})
+
+            if path == "/api/admin/pending":
+                password = str(data.get("password", ""))
+                if not _admin_ok(password):
+                    return respond({"error": "غير مصرح."}, 401)
+                return respond({"ok": True, "deals": list_pending_deals()})
+
+            if path == "/api/admin/offers":
+                password = str(data.get("password", ""))
+                if not _admin_ok(password):
+                    return respond({"error": "غير مصرح."}, 401)
+                return respond({"ok": True, "offers": list_admin_offers()})
+
+            if path == "/api/admin/decision":
+                password = str(data.get("password", ""))
+                if not _admin_ok(password):
+                    return respond({"error": "غير مصرح."}, 401)
+                deal_id = str(data.get("deal_id", "")).strip()
+                action = str(data.get("action", "")).strip()
+                if action not in {"paid", "rejected"} or not deal_id:
+                    return respond({"error": "بيانات القرار غير صالحة."}, 400)
+                if not set_deal_status(deal_id, action):
+                    return respond({"error": "طلب الدفع غير موجود."}, 404)
+                return respond({"ok": True, "status": action})
+
+            if path == "/api/admin/offer-update":
+                password = str(data.get("password", ""))
+                if not _admin_ok(password):
+                    return respond({"error": "غير مصرح."}, 401)
+                try:
+                    offer_id = int(data.get("offer_id", 0))
+                    ok = update_offer_links(offer_id, str(data.get("whatsapp_url", "")), str(data.get("instagram_url", "")), str(data.get("image_url", "")))
+                except (ValueError, TypeError) as exc:
+                    return respond({"error": str(exc)}, 400)
+                if not ok:
+                    return respond({"error": "الإعلان غير موجود."}, 404)
+                return respond({"ok": True})
+
+            if path == "/api/deal/start":
+                session_id = str(data.get("session_id", "")).strip()
+                try:
+                    offer_id = int(data.get("offer_id", 0))
+                except (TypeError, ValueError):
+                    offer_id = 0
+                if not session_id or not offer_id:
+                    return respond({"error": "بيانات الصفقة غير مكتملة."}, 400)
+                offer = get_offer_by_id(offer_id)
+                if offer is None:
+                    return respond({"error": "الإعلان غير موجود."}, 404)
+                row = create_or_get_deal(session_id, offer_id)
+                if not row:
+                    return respond({"error": "هذا الإعلان غير متاح ضمن نتائج البحث الحالية."}, 403)
+                return respond(_deal_response(row))
+
+            if path == "/api/deal/submit":
+                session_id = str(data.get("session_id", "")).strip()
+                deal_id = str(data.get("deal_id", "")).strip()
+                transaction_ref = str(data.get("transaction_ref", "")).strip()
+                if not session_id or not deal_id or not transaction_ref:
+                    return respond({"error": "يلزم رقم/مرجع التحويل."}, 400)
+                row = submit_deal_payment(deal_id, session_id, transaction_ref)
+                if not row:
+                    return respond({"error": "طلب الدفع غير موجود أو لا يخص هذه الجلسة."}, 403)
+                return respond(_deal_response(row))
+
+            if path == "/api/deal/open":
+                session_id = str(data.get("session_id", "")).strip()
+                deal_id = str(data.get("deal_id", "")).strip()
+                channel = str(data.get("channel", "")).strip().lower()
+                if channel not in {"whatsapp", "instagram"}:
+                    return respond({"error": "نوع الرابط غير صالح."}, 400)
+                row = deal_status_for_session(deal_id, session_id)
+                if not row or row["status"] != "paid":
+                    return respond({"error": "يجب التحقق من الدفع لهذا الإعلان أولاً."}, 402)
+                offer = get_offer_by_id(int(row["offer_id"]))
+                if offer is None:
+                    return respond({"error": "الإعلان غير موجود."}, 404)
+                url = offer.whatsapp_url if channel == "whatsapp" else offer.instagram_url
+                parsed = urlparse(url)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    return respond({"error": "رابط المتجر لهذا الإعلان غير مُضاف أو غير صالح. حدّثيه من لوحة الإدارة."}, 400)
+                return respond({"ok": True, "url": url})
 
             if path == "/api/recommend":
                 query = str(data.get("query", "")).strip()
