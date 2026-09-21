@@ -1,1 +1,2 @@
 gunicorn>=22,<24
+google-genai>=1.67,<2

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
 import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -17,9 +20,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlparse
 
 try:
-    import google.generativeai as genai  # type: ignore
+    from google import genai  # type: ignore
+    from google.genai import types as genai_types  # type: ignore
 except Exception:  # Optional dependency.
     genai = None
+    genai_types = None
 
 
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -27,7 +32,7 @@ PORT = int(os.getenv("PORT", "8000"))
 DB_PATH = Path(os.getenv("DATABASE_FILE", "decision_engine.db"))
 if not DB_PATH.is_absolute():
     DB_PATH = Path(__file__).with_name(DB_PATH.name)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 
 logging.basicConfig(
@@ -42,6 +47,8 @@ PAYMENT_BANK_AR = "البنك العربي"
 PAYMENT_ALIAS = os.getenv("PAYMENT_ALIAS", "MQRB").strip()
 DEAL_PRICE_JOD = float(os.getenv("DEAL_PRICE_JOD", "1"))
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+PAYMENT_WEBHOOK_SECRET = os.getenv("PAYMENT_WEBHOOK_SECRET", "").strip()
+AUTH_DAYS = int(os.getenv("AUTH_DAYS", "30"))
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +72,7 @@ class Offer:
     instagram_url: str
     sizes: List[str] = field(default_factory=list)
     size_system: str = ""  # bra | shoe_eu | shoe_us | clothing_letter | scarf_dimensions | ""
+    store_url: str = ""
 
 
 SEED_OFFERS: Sequence[Offer] = (
@@ -640,59 +648,98 @@ def detect_product_terms(text: str) -> List[str]:
 # Optional Gemini extraction (extended schema)
 # ---------------------------------------------------------------------------
 
-_GEMINI_MODEL_CACHE: Any = None
+_GEMINI_CLIENT: Any = None
 
 
 def gemini_model() -> Any:
-    global _GEMINI_MODEL_CACHE
-    if _GEMINI_MODEL_CACHE is not None:
-        return _GEMINI_MODEL_CACHE
+    global _GEMINI_CLIENT
+    if _GEMINI_CLIENT is not None:
+        return _GEMINI_CLIENT
     if not genai or not GOOGLE_API_KEY:
         return None
     try:
-        genai.configure(api_key=GOOGLE_API_KEY)
-        _GEMINI_MODEL_CACHE = genai.GenerativeModel(GEMINI_MODEL)
-        return _GEMINI_MODEL_CACHE
+        _GEMINI_CLIENT = genai.Client(api_key=GOOGLE_API_KEY)
+        return _GEMINI_CLIENT
     except Exception as exc:
         LOGGER.warning("Gemini initialization skipped: %s", exc)
         return None
 
 
 def extract_with_gemini(user_text: str) -> Dict[str, Any]:
-    model = gemini_model()
-    if model is None:
+    client = gemini_model()
+    if client is None:
         return {}
-
     prompt = f"""
-أنت محلل نوايا شراء للسوق الأردني. حلّل النص العربي باللهجة الأردنية/الشامية.
-أعد JSON فقط بدون markdown وبالمفاتيح:
+أنت محرك فهم طلبات شراء للسوق الأردني. افهم العربية الفصحى والعامية الأردنية والشامية، والأخطاء الإملائية، والكلمات الناقصة، والعربي-الإنجليزي المختلط، والاختصارات. لا تعتمد على تطابق الكلمات حرفيًا.
+أعد JSON فقط بهذه المفاتيح:
 category: قائمة من makeup, clothes, gifts, watches, perfumes, shoes, lingerie, scarves
 budget: {{"amount": رقم أو null, "kind": واحدة من hard_max, soft_target, flexible, cheapest, quality_first, none}}
 colors: قائمة canonical English colors المطلوبة
-excluded_colors: ألوان رفضتها المستخدمة صراحة
-excluded_terms: خامات/أنواع رفضتها (مثل شيفون)
+excluded_colors: ألوان رُفضت صراحة
+excluded_terms: خامات/أنواع رُفضت صراحة
 styles: قائمة من luxury, party, modest, classic, minimal, gift
-sizes: {{"system": bra|shoe_eu|shoe_us|clothing_letter|scarf_dimensions|null, "value": قيمة المقاس أو null, "band": رقم أو null, "cup": حرف أو null}}
-brand_soft: اسم براند عالمي ذُكر كمرجع (مثل Zara) أو null
-product_terms: كلمات المنتج المهمة
+sizes: {{"system": bra|shoe_eu|shoe_us|clothing_letter|scarf_dimensions|null, "value": قيمة أو null, "band": رقم أو null, "cup": حرف أو null}}
+brand_soft: اسم براند ذُكر فقط كمرجع أو null
+product_terms: كلمات/مفاهيم أساسية للمنتج حتى لو كانت باللهجة المحلية أو بالإنجليزية
+synonyms: 5-15 مفاهيم بديلة تساعد البحث الدلالي
 
-القواعد: "تحت/ما يتجاوز/ما بدفع أكثر" = hard_max. "بحدود/حوالي/تقريبًا" = soft_target. "ممكن أزيد لو الجودة" = flexible.
+قواعد الميزانية: تحت/ما يتجاوز/ما بدفع أكثر = hard_max. بحدود/حوالي/تقريبًا = soft_target. ممكن أزيد لو الجودة = flexible.
 
-النص: {user_text!r}
+النص الأصلي: {user_text!r}
 """
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(response_mime_type="application/json") if genai_types else None,
+        )
         raw = getattr(response, "text", "") or ""
-        match = re.search(r"\{.*\}", raw, re.S)
-        if not match:
-            return {}
-        parsed = json.loads(match.group(0))
-        if not isinstance(parsed, dict):
-            return {}
-        return parsed
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
     except Exception as exc:
         LOGGER.warning("Gemini extraction failed; using local parser: %s", exc)
         return {}
+
+
+def ai_rerank(user_text: str, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    client = gemini_model()
+    if client is None or not results:
+        return results
+    candidates = []
+    for item in results[:18]:
+        candidates.append({
+            "id": item["id"], "title": item["title"], "category": item["category"],
+            "price_jod": item["price_jod"], "tags": item.get("tags", []),
+            "colors": item.get("colors", []), "style": item.get("style", []),
+            "description": item.get("description", ""), "sizes": item.get("sizes", []),
+        })
+    prompt = f"""
+رتّب المرشحين لطلب شراء عربي أردني طبيعي. احسب الملاءمة الدلالية لاختلاف اللهجة والمرادفات والأخطاء الإملائية والعربي-الإنجليزي. لا تستبعد المرشح فقط لأن الكلمات مختلفة. لا تغيّر قيود الميزانية الصريحة.
+أعد JSON على شكل قائمة فقط: [{{"id": رقم, "score": رقم من 0 إلى 100, "reasons": [عبارتان عربيتان مختصرتان]}}].
+طلب المستخدم: {user_text!r}
+المرشحون: {json.dumps(candidates, ensure_ascii=False)}
+"""
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(response_mime_type="application/json") if genai_types else None,
+        )
+        parsed = json.loads(getattr(response, "text", "[]") or "[]")
+        if not isinstance(parsed, list):
+            return results
+        ranking = {int(x["id"]):(float(x.get("score",0)), x.get("reasons") or []) for x in parsed if isinstance(x,dict) and str(x.get("id","")).isdigit()}
+        for item in results:
+            if item["id"] in ranking:
+                score, rs = ranking[item["id"]]
+                item["score"] = round(max(item["score"], min(100.0, score)), 2)
+                item["reasons"] = list(dict.fromkeys(rs + item.get("reasons", [])))[:4]
+                item["match_type"] = "توصية ذكية" if item["score"] >= 60 else "توصية قريبة"
+        results.sort(key=lambda x: (-x["score"], x["price_jod"], x["id"]))
+        return results
+    except Exception as exc:
+        LOGGER.warning("Gemini rerank failed; keeping local order: %s", exc)
+        return results
 
 
 def _as_list(value: Any) -> List[str]:
@@ -922,6 +969,80 @@ CREATE INDEX IF NOT EXISTS idx_deal_access_session ON deal_access(session_id);
 CREATE INDEX IF NOT EXISTS idx_deal_access_offer ON deal_access(offer_id);
 CREATE INDEX IF NOT EXISTS idx_deal_access_status ON deal_access(status);
 
+CREATE TABLE IF NOT EXISTS users (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+full_name TEXT NOT NULL,
+phone TEXT NOT NULL UNIQUE,
+password_salt TEXT NOT NULL,
+password_hash TEXT NOT NULL,
+created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+token_hash TEXT PRIMARY KEY,
+user_id INTEGER NOT NULL,
+expires_at TEXT NOT NULL,
+created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS carts (
+user_id INTEGER PRIMARY KEY,
+updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS cart_items (
+user_id INTEGER NOT NULL,
+offer_id INTEGER NOT NULL,
+created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+PRIMARY KEY (user_id, offer_id)
+);
+
+CREATE TABLE IF NOT EXISTS payment_batches (
+batch_id TEXT PRIMARY KEY,
+user_id INTEGER NOT NULL,
+item_count INTEGER NOT NULL,
+total_jod REAL NOT NULL,
+payer_name TEXT,
+status TEXT NOT NULL DEFAULT 'draft',
+created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+submitted_at TEXT,
+approved_at TEXT,
+rejected_at TEXT,
+approved_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS payment_batch_items (
+batch_id TEXT NOT NULL,
+offer_id INTEGER NOT NULL,
+deal_id TEXT NOT NULL UNIQUE,
+PRIMARY KEY (batch_id, offer_id)
+);
+
+CREATE TABLE IF NOT EXISTS suggestions (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+user_id INTEGER,
+message TEXT NOT NULL,
+created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+status TEXT NOT NULL DEFAULT 'new'
+);
+
+CREATE TABLE IF NOT EXISTS payment_events (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+external_id TEXT NOT NULL UNIQUE,
+payer_name TEXT NOT NULL,
+amount_jod REAL NOT NULL,
+raw_message TEXT,
+received_at TEXT DEFAULT CURRENT_TIMESTAMP,
+matched_batch_id TEXT,
+match_status TEXT NOT NULL DEFAULT 'unmatched'
+);
+CREATE INDEX IF NOT EXISTS idx_payment_events_status ON payment_events(match_status);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_cart_items_user ON cart_items(user_id);
+CREATE INDEX IF NOT EXISTS idx_payment_batches_user ON payment_batches(user_id);
+CREATE INDEX IF NOT EXISTS idx_payment_batches_status ON payment_batches(status);
+
 CREATE INDEX IF NOT EXISTS idx_offers_category ON merchant_offers(category);
 CREATE INDEX IF NOT EXISTS idx_offers_price ON merchant_offers(price_jod);
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
@@ -947,6 +1068,16 @@ def init_db() -> None:
             _ensure_columns(conn, "merchant_offers", {
                 "sizes": "TEXT NOT NULL DEFAULT '[]'",
                 "size_system": "TEXT NOT NULL DEFAULT ''",
+                "store_url": "TEXT NOT NULL DEFAULT ''",
+            })
+            _ensure_columns(conn, "sessions", {
+                "user_id": "INTEGER",
+                "raw_query": "TEXT NOT NULL DEFAULT ''",
+            })
+            _ensure_columns(conn, "deal_access", {
+                "user_id": "INTEGER",
+                "batch_id": "TEXT",
+                "payer_name": "TEXT",
             })
             _ensure_columns(conn, "buyer_intents", {
                 "budget_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -955,18 +1086,21 @@ def init_db() -> None:
             rows = [(
                 o.id, o.merchant_name, o.title, o.category, o.price_jod,
                 serialize_json(o.tags), serialize_json(o.colors), serialize_json(o.style),
-                o.city, o.description, o.image_url, o.whatsapp_url, o.instagram_url,
+                o.city, o.description, o.image_url, o.whatsapp_url, o.instagram_url, o.store_url,
                 serialize_json(o.sizes), o.size_system,
             ) for o in SEED_OFFERS]
             conn.executemany(
                 """
                 INSERT OR IGNORE INTO merchant_offers
                 (id, merchant_name, title, category, price_jod, tags, colors, style, city,
-                 description, image_url, whatsapp_url, instagram_url, sizes, size_system)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 description, image_url, whatsapp_url, instagram_url, store_url, sizes, size_system)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
+            conn.execute("UPDATE merchant_offers SET whatsapp_url = '' WHERE whatsapp_url IN ('https://wa.me','http://wa.me','wa.me')")
+            conn.execute("UPDATE merchant_offers SET instagram_url = '' WHERE instagram_url IN ('https://instagram.com','http://instagram.com','instagram.com')")
+            conn.execute("UPDATE merchant_offers SET store_url = '' WHERE store_url IS NULL")
             conn.commit()
             count = conn.execute("SELECT COUNT(*) FROM merchant_offers").fetchone()[0]
             LOGGER.info("DB ready at %s — %d offers", DB_PATH, count)
@@ -1019,18 +1153,27 @@ def save_buyer_intent(request_id: str, raw_query: str, intent: Dict[str, Any]) -
             conn.close()
 
 
-def create_session(session_id: str, intent: Dict[str, Any], user_ip: str = "") -> None:
+def create_session(session_id: str, intent: Dict[str, Any], user_ip: str = "", user_id: Optional[int] = None, raw_query: str = "") -> None:
     with DB_LOCK:
         conn = get_connection()
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO sessions (session_id, user_ip, intent_json, updated_at) "
-                "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                (session_id, user_ip, serialize_json(intent)),
+                "INSERT OR REPLACE INTO sessions (session_id, user_ip, intent_json, user_id, raw_query, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (session_id, user_ip, serialize_json(intent), user_id, raw_query[:2000]),
             )
             conn.commit()
         finally:
             conn.close()
+
+
+def get_session_meta(session_id: str) -> Optional[sqlite3.Row]:
+    ensure_db()
+    conn = get_connection()
+    try:
+        return conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+    finally:
+        conn.close()
 
 
 def get_session_intent(session_id: str) -> Optional[Dict[str, Any]]:
@@ -1067,6 +1210,7 @@ def get_offer_by_id(offer_id: int) -> Optional[Offer]:
             whatsapp_url=row["whatsapp_url"], instagram_url=row["instagram_url"],
             sizes=read_json_list(row["sizes"]) if "sizes" in row.keys() else [],
             size_system=row["size_system"] if "size_system" in row.keys() else "",
+            store_url=row["store_url"] if "store_url" in row.keys() else "",
         )
     finally:
         conn.close()
@@ -1196,16 +1340,20 @@ def list_pending_deals() -> List[Dict[str, Any]]:
         conn.close()
 
 
-def update_offer_links(offer_id: int, whatsapp_url: str, instagram_url: str, image_url: str) -> bool:
-    def clean_url(value: str, label: str) -> str:
+def update_offer_links(offer_id: int, store_url: str, whatsapp_url: str, instagram_url: str, image_url: str) -> bool:
+    def clean_url(value: str, label: str, allow_empty: bool = True) -> str:
         value = value.strip()[:2000]
-        if not value:
+        if not value and allow_empty:
             return ""
         parsed = urlparse(value)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError(f"{label} يجب أن يكون رابطًا يبدأ بـ https://")
+        host = (parsed.hostname or "").lower()
+        if host in {"wa.me", "instagram.com", "www.instagram.com", "unsplash.com", "www.unsplash.com"} and not parsed.path.strip("/"):
+            raise ValueError(f"{label}: استخدمي رابط الصفحة/المتجر الحقيقي، وليس الرابط العام للموقع.")
         return value
 
+    store_url = clean_url(store_url, "رابط المتجر")
     whatsapp_url = clean_url(whatsapp_url, "رابط واتساب")
     instagram_url = clean_url(instagram_url, "رابط إنستغرام")
     image_url = clean_url(image_url, "رابط الصورة")
@@ -1215,9 +1363,9 @@ def update_offer_links(offer_id: int, whatsapp_url: str, instagram_url: str, ima
         try:
             cur = conn.execute(
                 """UPDATE merchant_offers
-                   SET whatsapp_url = ?, instagram_url = ?, image_url = ?
+                   SET store_url = ?, whatsapp_url = ?, instagram_url = ?, image_url = ?
                    WHERE id = ?""",
-                (whatsapp_url, instagram_url, image_url, offer_id),
+                (store_url, whatsapp_url, instagram_url, image_url, offer_id),
             )
             conn.commit()
             return cur.rowcount == 1
@@ -1230,13 +1378,337 @@ def list_admin_offers() -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
         rows = conn.execute(
-            """SELECT id, merchant_name, title, price_jod, whatsapp_url, instagram_url, image_url
+            """SELECT id, merchant_name, title, price_jod, store_url, whatsapp_url, instagram_url, image_url
                FROM merchant_offers ORDER BY id ASC"""
         ).fetchall()
         return [dict(row) for row in rows]
     finally:
         conn.close()
 
+
+
+
+def _hash_password(password: str, salt: Optional[bytes] = None) -> Tuple[str, str]:
+    if len(password) < 6:
+        raise ValueError("كلمة المرور يجب أن تكون 6 أحرف/أرقام على الأقل.")
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 210_000)
+    return salt.hex(), digest.hex()
+
+
+def _verify_password(password: str, salt_hex: str, expected_hex: str) -> bool:
+    try:
+        salt = bytes.fromhex(salt_hex)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 210_000)
+        return hmac.compare_digest(digest.hex(), expected_hex)
+    except Exception:
+        return False
+
+
+def _normalize_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    if digits.startswith("00962"):
+        digits = digits[5:]
+    if digits.startswith("962") and len(digits) > 9:
+        digits = digits[3:]
+    if digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) < 8:
+        raise ValueError("أدخلي رقم هاتف صحيح.")
+    return "+962" + digits
+
+
+def register_user(full_name: str, phone: str, password: str) -> str:
+    full_name = " ".join((full_name or "").split())[:100]
+    if len(full_name) < 2:
+        raise ValueError("أدخلي اسمك.")
+    phone = _normalize_phone(phone)
+    salt, digest = _hash_password(password)
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            try:
+                cur = conn.execute("INSERT INTO users (full_name, phone, password_salt, password_hash) VALUES (?, ?, ?, ?)", (full_name, phone, salt, digest))
+            except sqlite3.IntegrityError:
+                raise ValueError("هذا الرقم مسجّل من قبل. استخدمي تسجيل الدخول.")
+            conn.execute("INSERT OR IGNORE INTO carts (user_id) VALUES (?)", (cur.lastrowid,))
+            conn.commit()
+            user_id = int(cur.lastrowid)
+        finally:
+            conn.close()
+    return create_auth_token(user_id)
+
+
+def login_user(phone: str, password: str) -> str:
+    phone = _normalize_phone(phone)
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM users WHERE phone = ?", (phone,)).fetchone()
+        if not row or not _verify_password(password, row["password_salt"], row["password_hash"]):
+            raise ValueError("رقم الهاتف أو كلمة المرور غير صحيحة.")
+        return create_auth_token(int(row["id"]))
+    finally:
+        conn.close()
+
+
+def create_auth_token(user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    expires_at = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + AUTH_DAYS * 86400))
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            conn.execute("DELETE FROM auth_sessions WHERE expires_at < CURRENT_TIMESTAMP")
+            conn.execute("INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)", (token_hash, user_id, expires_at))
+            conn.commit()
+        finally:
+            conn.close()
+    return token
+
+
+def get_user_from_token(token: str) -> Optional[sqlite3.Row]:
+    token = (token or "").strip()
+    if not token:
+        return None
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    conn = get_connection()
+    try:
+        return conn.execute(
+            """SELECT u.* FROM auth_sessions s JOIN users u ON u.id = s.user_id
+               WHERE s.token_hash = ? AND s.expires_at >= CURRENT_TIMESTAMP""",
+            (token_hash,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def get_user_cart(user_id: int) -> Dict[str, Any]:
+    ensure_db()
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT m.id, m.merchant_name, m.title, m.price_jod, m.image_url
+               FROM cart_items c JOIN merchant_offers m ON m.id = c.offer_id
+               WHERE c.user_id = ? ORDER BY c.created_at DESC""",
+            (user_id,),
+        ).fetchall()
+        items = [dict(r) for r in rows]
+        total = round(len(items) * DEAL_PRICE_JOD, 2)
+        return {"items": items, "count": len(items), "total_jod": total}
+    finally:
+        conn.close()
+
+
+def user_has_paid_offer(user_id: int, offer_id: int) -> bool:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """SELECT 1 FROM deal_access WHERE user_id = ? AND offer_id = ? AND status = 'paid' LIMIT 1""",
+            (user_id, offer_id),
+        ).fetchone()
+        return bool(row)
+    finally:
+        conn.close()
+
+
+def add_to_cart(user_id: int, offer_id: int) -> Dict[str, Any]:
+    ensure_db()
+    if get_offer_by_id(offer_id) is None:
+        raise ValueError("الإعلان غير موجود.")
+    if user_has_paid_offer(user_id, offer_id):
+        raise ValueError("هذا الإعلان مفتوح لديك مسبقًا.")
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            conn.execute("INSERT OR IGNORE INTO carts (user_id, updated_at) VALUES (?, CURRENT_TIMESTAMP)", (user_id,))
+            conn.execute("INSERT OR IGNORE INTO cart_items (user_id, offer_id) VALUES (?, ?)", (user_id, offer_id))
+            conn.execute("UPDATE carts SET updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (user_id,))
+            conn.commit()
+        finally:
+            conn.close()
+    return get_user_cart(user_id)
+
+
+def remove_from_cart(user_id: int, offer_id: int) -> Dict[str, Any]:
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            conn.execute("DELETE FROM cart_items WHERE user_id = ? AND offer_id = ?", (user_id, offer_id))
+            conn.execute("UPDATE carts SET updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (user_id,))
+            conn.commit()
+        finally:
+            conn.close()
+    return get_user_cart(user_id)
+
+
+def start_checkout(user_id: int) -> Dict[str, Any]:
+    cart = get_user_cart(user_id)
+    if not cart["items"]:
+        raise ValueError("سلتك فارغة.")
+    item_ids = [int(x["id"]) for x in cart["items"]]
+    if any(user_has_paid_offer(user_id, oid) for oid in item_ids):
+        raise ValueError("يوجد إعلان مفتوح لديك بالفعل في السلة. حدّثي السلة ثم حاولي مرة أخرى.")
+    batch_id = uuid.uuid4().hex
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            conn.execute("INSERT INTO payment_batches (batch_id, user_id, item_count, total_jod, status) VALUES (?, ?, ?, ?, 'draft')", (batch_id, user_id, cart["count"], cart["total_jod"]))
+            for offer_id in item_ids:
+                deal_id = uuid.uuid4().hex
+                conn.execute("INSERT INTO deal_access (deal_id, session_id, offer_id, status, user_id, batch_id) VALUES (?, ?, ?, 'pending_payment', ?, ?)", (deal_id, "", offer_id, user_id, batch_id))
+                conn.execute("INSERT INTO payment_batch_items (batch_id, offer_id, deal_id) VALUES (?, ?, ?)", (batch_id, offer_id, deal_id))
+            conn.execute("DELETE FROM cart_items WHERE user_id = ?", (user_id,))
+            conn.commit()
+        finally:
+            conn.close()
+    return get_payment_batch(user_id, batch_id)
+
+
+def get_payment_batch(user_id: int, batch_id: str) -> Dict[str, Any]:
+    conn = get_connection()
+    try:
+        b = conn.execute("SELECT * FROM payment_batches WHERE batch_id = ? AND user_id = ?", (batch_id, user_id)).fetchone()
+        if not b:
+            raise ValueError("الطلب غير موجود.")
+        items = conn.execute(
+            """SELECT m.id, m.title, m.merchant_name, m.price_jod, p.deal_id, d.status, m.store_url, m.whatsapp_url, m.instagram_url
+               FROM payment_batch_items p JOIN merchant_offers m ON m.id=p.offer_id
+               JOIN deal_access d ON d.deal_id=p.deal_id WHERE p.batch_id=? ORDER BY m.id""",
+            (batch_id,),
+        ).fetchall()
+        out = dict(b)
+        out["items"] = [dict(r) for r in items]
+        return out
+    finally:
+        conn.close()
+
+
+def submit_checkout(user_id: int, batch_id: str, payer_name: str) -> Dict[str, Any]:
+    payer_name = " ".join((payer_name or "").split())[:120]
+    if len(payer_name) < 2:
+        raise ValueError("اكتبي الاسم الذي تم التحويل منه كما يظهر في إشعار البنك.")
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            row = conn.execute("SELECT * FROM payment_batches WHERE batch_id=? AND user_id=?", (batch_id, user_id)).fetchone()
+            if not row:
+                raise ValueError("الطلب غير موجود.")
+            if row["status"] not in {"draft", "rejected"}:
+                return get_payment_batch(user_id, batch_id)
+            conn.execute("UPDATE payment_batches SET payer_name=?, status='payment_submitted', submitted_at=CURRENT_TIMESTAMP WHERE batch_id=?", (payer_name, batch_id))
+            conn.execute("UPDATE deal_access SET status='payment_submitted', payer_name=? WHERE batch_id=?", (payer_name, batch_id))
+            conn.commit()
+        finally:
+            conn.close()
+    return get_payment_batch(user_id, batch_id)
+
+
+def list_user_batches(user_id: int) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    try:
+        batches = conn.execute("SELECT * FROM payment_batches WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall()
+        out=[]
+        for b in batches:
+            item_rows = conn.execute("""SELECT m.id,m.title,m.merchant_name,m.price_jod,p.deal_id,d.status,m.store_url,m.whatsapp_url,m.instagram_url
+                                      FROM payment_batch_items p JOIN merchant_offers m ON m.id=p.offer_id
+                                      JOIN deal_access d ON d.deal_id=p.deal_id WHERE p.batch_id=? ORDER BY m.id""", (b["batch_id"],)).fetchall()
+            x=dict(b); x["items"]= [dict(r) for r in item_rows]; out.append(x)
+        return out
+    finally:
+        conn.close()
+
+
+def list_pending_batches() -> List[Dict[str, Any]]:
+    conn = get_connection()
+    try:
+        rows=conn.execute("""SELECT p.*, u.full_name, u.phone FROM payment_batches p JOIN users u ON u.id=p.user_id
+                             WHERE p.status='payment_submitted' ORDER BY p.submitted_at DESC""").fetchall()
+        out=[]
+        for b in rows:
+            x=dict(b)
+            x["items"]=[dict(r) for r in conn.execute("""SELECT m.title,m.merchant_name,m.price_jod,p.offer_id FROM payment_batch_items p JOIN merchant_offers m ON m.id=p.offer_id WHERE p.batch_id=? ORDER BY m.id""", (b["batch_id"],)).fetchall()]
+            out.append(x)
+        return out
+    finally:
+        conn.close()
+
+
+def set_batch_status(batch_id: str, status: str) -> bool:
+    if status not in {"paid", "rejected"}:
+        return False
+    with DB_LOCK:
+        conn=get_connection()
+        try:
+            b=conn.execute("SELECT * FROM payment_batches WHERE batch_id=?", (batch_id,)).fetchone()
+            if not b: return False
+            if status=='paid':
+                conn.execute("UPDATE payment_batches SET status='paid', approved_at=CURRENT_TIMESTAMP, approved_by='admin' WHERE batch_id=?", (batch_id,))
+                conn.execute("UPDATE deal_access SET status='paid', approved_at=CURRENT_TIMESTAMP, approved_by='admin' WHERE batch_id=?", (batch_id,))
+            else:
+                conn.execute("UPDATE payment_batches SET status='rejected', rejected_at=CURRENT_TIMESTAMP WHERE batch_id=?", (batch_id,))
+                conn.execute("UPDATE deal_access SET status='rejected' WHERE batch_id=?", (batch_id,))
+            conn.commit(); return True
+        finally: conn.close()
+
+
+
+def _normalize_person_name(value: str) -> str:
+    text = normalize_text(value or "")
+    text = re.sub(r"[إأآٱ]", "ا", text)
+    text = text.replace("ى", "ي").replace("ؤ", "و").replace("ئ", "ي")
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return " ".join(text.split())
+
+
+def process_incoming_payment(external_id: str, payer_name: str, amount_jod: float, raw_message: str = "") -> Dict[str, Any]:
+    if not PAYMENT_WEBHOOK_SECRET:
+        raise ValueError("لم يتم إعداد PAYMENT_WEBHOOK_SECRET بعد.")
+    external_id = (external_id or "").strip()[:200]
+    payer_name = " ".join((payer_name or "").split())[:120]
+    amount_jod = round(float(amount_jod), 2)
+    if not external_id or not payer_name or amount_jod <= 0:
+        raise ValueError("بيانات الحوالة غير مكتملة.")
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            try:
+                conn.execute("INSERT INTO payment_events (external_id,payer_name,amount_jod,raw_message) VALUES (?,?,?,?)", (external_id,payer_name,amount_jod,raw_message[:4000]))
+            except sqlite3.IntegrityError:
+                row=conn.execute("SELECT * FROM payment_events WHERE external_id=?", (external_id,)).fetchone()
+                return dict(row) if row else {"match_status":"duplicate"}
+            candidates=conn.execute("SELECT * FROM payment_batches WHERE status='payment_submitted' AND ABS(total_jod-?) < 0.01 ORDER BY submitted_at ASC", (amount_jod,)).fetchall()
+            name_key=_normalize_person_name(payer_name)
+            matches=[b for b in candidates if _normalize_person_name(b["payer_name"] or "") == name_key]
+            if len(matches)==1:
+                batch=matches[0]
+                conn.execute("UPDATE payment_batches SET status='paid', approved_at=CURRENT_TIMESTAMP, approved_by='auto' WHERE batch_id=?", (batch["batch_id"],))
+                conn.execute("UPDATE deal_access SET status='paid', approved_at=CURRENT_TIMESTAMP, approved_by='auto' WHERE batch_id=?", (batch["batch_id"],))
+                conn.execute("UPDATE payment_events SET matched_batch_id=?, match_status='matched' WHERE external_id=?", (batch["batch_id"], external_id))
+            elif len(matches)>1:
+                conn.execute("UPDATE payment_events SET match_status='ambiguous' WHERE external_id=?", (external_id,))
+            else:
+                conn.execute("UPDATE payment_events SET match_status='unmatched' WHERE external_id=?", (external_id,))
+            conn.commit()
+            row=conn.execute("SELECT * FROM payment_events WHERE external_id=?", (external_id,)).fetchone()
+            return dict(row) if row else {"match_status":"unmatched"}
+        finally: conn.close()
+
+def list_suggestions() -> List[Dict[str, Any]]:
+    conn=get_connection()
+    try:
+        rows=conn.execute("""SELECT s.*,u.full_name,u.phone FROM suggestions s LEFT JOIN users u ON u.id=s.user_id ORDER BY s.created_at DESC LIMIT 200""").fetchall()
+        return [dict(r) for r in rows]
+    finally: conn.close()
+
+
+def save_suggestion(user_id: Optional[int], message: str) -> None:
+    message = " ".join((message or "").split())[:1000]
+    if len(message) < 3: raise ValueError("اكتبي الاقتراح أولًا.")
+    with DB_LOCK:
+        conn=get_connection()
+        try:
+            conn.execute("INSERT INTO suggestions (user_id,message) VALUES (?,?)", (user_id,message)); conn.commit()
+        finally: conn.close()
 
 def _admin_ok(password: str) -> bool:
     return bool(ADMIN_PASSWORD) and hmac.compare_digest(password, ADMIN_PASSWORD)
@@ -1246,22 +1718,24 @@ def _admin_page() -> str:
     return r"""
 <!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>إدارة التوصية</title><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="bg-neutral-100 text-neutral-900"><main class="max-w-6xl mx-auto p-4 sm:p-8">
-<div class="flex items-center justify-between gap-4 mb-6"><div><h1 class="text-3xl font-black">لوحة إدارة التوصية</h1><p class="text-sm text-neutral-500 mt-1">تأكيد المدفوعات وإدارة روابط الإعلانات.</p></div><a href="/" class="rounded-xl bg-white px-4 py-2 font-black border">الموقع</a></div>
-<div id="loginBox" class="bg-white rounded-3xl p-5 border shadow-sm"><div class="font-black text-lg">تسجيل دخول الإدارة</div><p class="text-sm text-neutral-500 mt-1">كلمة المرور هي <span class="font-black">ADMIN_PASSWORD</span> الموجودة في Render.</p><div class="mt-4 flex gap-2"><input id="adminPassword" type="password" class="flex-1 rounded-xl bg-neutral-100 px-4 py-3 outline-none" placeholder="كلمة مرور الإدارة"><button onclick="login()" class="rounded-xl bg-neutral-950 text-white px-5 font-black">دخول</button></div><div id="loginMsg" class="text-sm mt-3"></div></div>
+<div class="flex items-center justify-between gap-4 mb-6"><div><h1 class="text-3xl font-black">لوحة إدارة التوصية</h1><p class="text-sm text-neutral-500 mt-1">المدفوعات، روابط المتاجر، واقتراحات المستخدمين.</p></div><a href="/" class="rounded-xl bg-white px-4 py-2 font-black border">الموقع</a></div>
+<div id="loginBox" class="bg-white rounded-3xl p-5 border shadow-sm"><div class="font-black text-lg">تسجيل دخول الإدارة</div><div class="mt-4 flex gap-2"><input id="adminPassword" type="password" class="flex-1 rounded-xl bg-neutral-100 px-4 py-3 outline-none" placeholder="كلمة مرور الإدارة"><button onclick="login()" class="rounded-xl bg-neutral-950 text-white px-5 font-black">دخول</button></div><div id="loginMsg" class="text-sm mt-3"></div></div>
 <div id="panel" class="hidden">
-<section class="mt-6 bg-white rounded-3xl p-5 border shadow-sm"><div class="flex items-center justify-between gap-3"><div><h2 class="text-xl font-black">طلبات الدفع</h2><p class="text-sm text-neutral-500">تحققي من التحويل البنكي في حسابك ثم اضغطي «تم الدفع».</p></div><button onclick="loadAll()" class="rounded-xl bg-neutral-100 px-4 py-2 font-black">تحديث</button></div><div id="deals" class="mt-4 space-y-3"></div></section>
-<section class="mt-6 bg-white rounded-3xl p-5 border shadow-sm"><div><h2 class="text-xl font-black">روابط الإعلانات</h2><p class="text-sm text-neutral-500">أضيفي روابط واتساب وإنستغرام والصورة الحقيقية لكل إعلان. لا ترسلي كلمات مرور أو أسرار هنا.</p></div><div id="offers" class="mt-4 space-y-4"></div></section>
+<section class="mt-6 bg-white rounded-3xl p-5 border shadow-sm"><div class="flex items-center justify-between gap-3"><div><h2 class="text-xl font-black">سلات/دفعات قيد التحقق</h2><p class="text-sm text-neutral-500">قارني الاسم والمبلغ مع حركة CliQ التي وصلت لحسابك ثم اعتمدي الدفعة كاملة.</p></div><button onclick="loadAll()" class="rounded-xl bg-neutral-100 px-4 py-2 font-black">تحديث</button></div><div id="batches" class="mt-4 space-y-3"></div></section>
+<section class="mt-6 bg-white rounded-3xl p-5 border shadow-sm"><div><h2 class="text-xl font-black">روابط الإعلانات</h2><p class="text-sm text-neutral-500">أضيفي رابط المتجر الحقيقي لكل إعلان. الرابط العام مثل wa.me أو instagram.com لن يُقبل.</p></div><div id="offers" class="mt-4 space-y-4"></div></section>
+<section class="mt-6 bg-white rounded-3xl p-5 border shadow-sm"><div><h2 class="text-xl font-black">صندوق الاقتراحات</h2><p class="text-sm text-neutral-500">آخر اقتراحات المستخدمين.</p></div><div id="suggestions" class="mt-4 space-y-3"></div></section>
 </div></main>
 <script>
 let password='';
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw new Error(d.error||'حدث خطأ');return d;}
 async function login(){const p=document.getElementById('adminPassword').value;if(!p)return;try{await api('/api/admin/login',{password:p});password=p;document.getElementById('loginBox').classList.add('hidden');document.getElementById('panel').classList.remove('hidden');loadAll();}catch(e){document.getElementById('loginMsg').textContent=e.message;document.getElementById('loginMsg').className='text-sm mt-3 text-red-600 font-bold';}}
-async function loadDeals(){const d=await api('/api/admin/pending',{password});const box=document.getElementById('deals');if(!d.deals.length){box.innerHTML='<div class="rounded-2xl bg-neutral-50 p-5 text-sm text-neutral-500">لا توجد طلبات دفع معلقة.</div>';return;}box.innerHTML=d.deals.map(x=>`<article class="rounded-2xl border p-4"><div class="font-black">${esc(x.title)} — ${esc(x.merchant_name)}</div><div class="text-sm text-neutral-500 mt-1">Deal: ${esc(x.deal_id)} · العرض ${esc(x.offer_id)} · المرجع: <span class="font-black text-neutral-900">${esc(x.transaction_ref)}</span></div><div class="text-xs text-neutral-400 mt-1">وقت الإرسال: ${esc(x.submitted_at||x.created_at)}</div><div class="mt-3 flex gap-2"><button onclick="decide('${esc(x.deal_id)}','paid')" class="rounded-xl bg-emerald-600 text-white px-4 py-2 font-black">تم الدفع</button><button onclick="decide('${esc(x.deal_id)}','rejected')" class="rounded-xl bg-red-50 text-red-700 px-4 py-2 font-black">رفض</button></div></article>`).join('');}
-async function decide(id,action){try{await api('/api/admin/decision',{password,deal_id:id,action});loadDeals();}catch(e){alert(e.message);}}
-async function loadOffers(){const d=await api('/api/admin/offers',{password});document.getElementById('offers').innerHTML=d.offers.map(x=>`<article class="rounded-2xl border p-4"><div class="font-black">#${x.id} — ${esc(x.merchant_name)} — ${esc(x.title)}</div><div class="grid md:grid-cols-3 gap-2 mt-3"><input data-id="${x.id}" data-field="whatsapp_url" value="${esc(x.whatsapp_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="رابط واتساب"><input data-id="${x.id}" data-field="instagram_url" value="${esc(x.instagram_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="رابط إنستغرام"><input data-id="${x.id}" data-field="image_url" value="${esc(x.image_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="رابط الصورة"><button onclick="saveOffer(${x.id})" class="rounded-xl bg-neutral-950 text-white px-4 py-3 font-black md:col-span-3">حفظ روابط الإعلان</button></div></article>`).join('');}
-async function saveOffer(id){const get=f=>document.querySelector(`[data-id="${id}"][data-field="${f}"]`).value;try{await api('/api/admin/offer-update',{password,offer_id:id,whatsapp_url:get('whatsapp_url'),instagram_url:get('instagram_url'),image_url:get('image_url')});alert('تم حفظ الروابط');}catch(e){alert(e.message);}}
-async function loadAll(){try{await Promise.all([loadDeals(),loadOffers()]);}catch(e){alert(e.message);}}
+async function loadBatches(){const d=await api('/api/admin/pending-batches',{password});const box=document.getElementById('batches');if(!d.batches.length){box.innerHTML='<div class="rounded-2xl bg-neutral-50 p-5 text-sm text-neutral-500">لا توجد دفعات معلقة.</div>';return;}box.innerHTML=d.batches.map(x=>`<article class="rounded-2xl border p-4"><div class="font-black">${esc(x.full_name)} — ${esc(x.phone)}</div><div class="text-sm text-neutral-500 mt-1">Batch: ${esc(x.batch_id)} · المبلغ المطلوب: <span class="font-black text-neutral-900">${esc(x.total_jod)} د.أ</span> · عدد الإعلانات: ${esc(x.item_count)}</div><div class="mt-2 text-sm">اسم المحوّل الذي أدخله المستخدم: <span class="font-black">${esc(x.payer_name||'—')}</span></div><div class="mt-3 rounded-2xl bg-neutral-50 p-3 text-sm">${x.items.map(i=>`<div>• ${esc(i.title)} — ${esc(i.merchant_name)} — ${esc(i.price_jod)} د.أ</div>`).join('')}</div><div class="mt-3 flex gap-2"><button onclick="decideBatch('${esc(x.batch_id)}','paid')" class="rounded-xl bg-emerald-600 text-white px-4 py-2 font-black">تم التحقق — فتح الطلبات</button><button onclick="decideBatch('${esc(x.batch_id)}','rejected')" class="rounded-xl bg-red-50 text-red-700 px-4 py-2 font-black">رفض</button></div></article>`).join('');}
+async function decideBatch(id,action){if(action==='paid'&&!confirm('هل تأكدتِ من وصول المبلغ المطلوب؟'))return;try{await api('/api/admin/batch-decision',{password,batch_id:id,action});loadAll();}catch(e){alert(e.message);}}
+async function loadOffers(){const d=await api('/api/admin/offers',{password});document.getElementById('offers').innerHTML=d.offers.map(x=>`<article class="rounded-2xl border p-4"><div class="font-black">#${x.id} — ${esc(x.merchant_name)} — ${esc(x.title)}</div><div class="text-xs mt-1 ${x.store_url?'text-emerald-600':'text-red-600'}">${x.store_url?'رابط المتجر مضبوط':'رابط المتجر غير مضاف بعد'}</div><div class="grid md:grid-cols-4 gap-2 mt-3"><input data-id="${x.id}" data-field="store_url" value="${esc(x.store_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="رابط المتجر الحقيقي"><input data-id="${x.id}" data-field="whatsapp_url" value="${esc(x.whatsapp_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="واتساب"><input data-id="${x.id}" data-field="instagram_url" value="${esc(x.instagram_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="إنستغرام"><input data-id="${x.id}" data-field="image_url" value="${esc(x.image_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="رابط الصورة"><button onclick="saveOffer(${x.id})" class="rounded-xl bg-neutral-950 text-white px-4 py-3 font-black md:col-span-4">حفظ</button></div></article>`).join('');}
+async function saveOffer(id){const get=f=>document.querySelector(`[data-id="${id}"][data-field="${f}"]`).value;try{await api('/api/admin/offer-update',{password,offer_id:id,store_url:get('store_url'),whatsapp_url:get('whatsapp_url'),instagram_url:get('instagram_url'),image_url:get('image_url')});alert('تم الحفظ');loadOffers();}catch(e){alert(e.message);}}
+async function loadSuggestions(){const d=await api('/api/admin/suggestions',{password});document.getElementById('suggestions').innerHTML=d.suggestions.length?d.suggestions.map(x=>`<div class="rounded-2xl border p-4"><div class="text-sm font-black">${esc(x.full_name||'زائر')}</div><div class="text-xs text-neutral-400 mt-1">${esc(x.created_at||'')}</div><div class="mt-2">${esc(x.message)}</div></div>`).join(''):'<div class="rounded-2xl bg-neutral-50 p-5 text-sm text-neutral-500">لا يوجد اقتراحات بعد.</div>';}
+async function loadAll(){try{await Promise.all([loadBatches(),loadOffers(),loadSuggestions()]);}catch(e){alert(e.message);}}
 </script></body></html>
 """
 
@@ -1453,7 +1927,7 @@ def score_offer(offer: Offer, intent: Dict[str, Any]) -> Tuple[float, List[str]]
     return max(0.0, min(100.0, round(score, 2))), (reasons or ["أقرب متاح لطلبك"])
 
 
-def recommend(intent: Dict[str, Any]) -> List[Dict[str, Any]]:
+def recommend(intent: Dict[str, Any], raw_query: str = "") -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     for offer in get_offers():
         score, reasons = score_offer(offer, intent)
@@ -1462,6 +1936,7 @@ def recommend(intent: Dict[str, Any]) -> List[Dict[str, Any]]:
         payload = asdict(offer)
         payload.pop("whatsapp_url", None)
         payload.pop("instagram_url", None)
+        payload.pop("store_url", None)
         payload["category_label"] = CATEGORY_LABELS.get(offer.category, offer.category)
         payload["score"] = score
         payload["reasons"] = reasons
@@ -1471,7 +1946,7 @@ def recommend(intent: Dict[str, Any]) -> List[Dict[str, Any]]:
         results.sort(key=lambda item: (item["price_jod"], -item["score"], item["id"]))
     else:
         results.sort(key=lambda item: (-item["score"], item["price_jod"], item["id"]))
-    return results
+    return ai_rerank(raw_query, results) if raw_query else results
 
 class PaymentProvider:
     """Interface — بدّلي الـ implementation لما يتوفر API رسمي."""
@@ -1545,8 +2020,9 @@ HTML_TEMPLATE = r"""
           <div class="text-[11px] text-neutral-400 font-bold">التوصية الذكية</div>
         </div>
       </div>
-      <div class="hidden sm:flex items-center gap-2 rounded-full bg-neutral-100 px-3 py-2 text-[11px] font-black text-neutral-600">
-        <span class="w-2 h-2 rounded-full bg-emerald-500"></span> LIVE FEED
+      <div class="flex items-center gap-2">
+        <button type="button" onclick="openCart()" class="relative rounded-2xl bg-neutral-100 px-3 py-2 text-xs font-black">🛒 السلة <span id="cartBadge" class="hidden absolute -top-2 -left-2 min-w-5 h-5 rounded-full bg-emerald-600 text-white text-[10px] flex items-center justify-center"></span></button>
+        <button type="button" onclick="openAccount()" id="accountBtn" class="rounded-2xl bg-neutral-950 text-white px-3 py-2 text-xs font-black">تسجيل الدخول</button>
       </div>
     </div>
   </header>
@@ -1586,6 +2062,7 @@ HTML_TEMPLATE = r"""
             <button type="submit" class="px-4 rounded-xl bg-neutral-100 hover:bg-neutral-200 font-black text-sm">حدّثي ↻</button>
           </div>
         </form>
+        <button type="button" onclick="openSuggestion()" class="mt-3 text-xs font-black text-neutral-500 hover:text-neutral-900">💡 صندوق اقتراحات</button>
       </div>
 
       <section class="max-w-6xl mx-auto mt-10">
@@ -1649,6 +2126,11 @@ HTML_TEMPLATE = r"""
       <div class="mt-3 text-[11px] text-neutral-400 leading-5">لا يوجد اعتماد على مربع «أؤكد أنني دفعت». التفعيل يتم من الخادم فقط بعد مراجعة التحويل.</div>
     </div>
   </div>
+  <div id="authModal" class="hidden fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"><div class="w-full max-w-md rounded-[2rem] bg-white p-6"><div class="flex items-center justify-between"><h3 class="text-2xl font-black">حسابك</h3><button onclick="closeAuth()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black">×</button></div><div class="mt-4 flex gap-2"><button id="loginTab" onclick="switchAuth('login')" class="flex-1 rounded-xl bg-neutral-950 text-white py-3 font-black">دخول</button><button id="registerTab" onclick="switchAuth('register')" class="flex-1 rounded-xl bg-neutral-100 py-3 font-black">حساب جديد</button></div><div id="authForm" class="mt-4 space-y-3"></div><div id="authMsg" class="text-sm mt-3"></div></div></div>
+  <div id="cartModal" class="hidden fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"><div class="w-full max-w-lg rounded-[2rem] bg-white p-6"><div class="flex items-center justify-between"><h3 class="text-2xl font-black">سلة الطلبات</h3><button onclick="closeCart()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black">×</button></div><div id="cartItems" class="mt-4 space-y-2"></div><div class="mt-4 rounded-2xl bg-neutral-50 p-4 flex items-center justify-between"><span class="font-black">الإجمالي</span><span id="cartTotal" class="font-black text-lg"></span></div><button onclick="startCheckoutFlow()" class="mt-4 w-full min-h-[52px] rounded-2xl bg-neutral-950 text-white font-black">الدفع للطلبات في السلة</button></div></div>
+  <div id="checkoutModal" class="hidden fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"><div class="w-full max-w-lg rounded-[2rem] bg-white p-6"><div class="flex items-center justify-between"><h3 class="text-2xl font-black">إتمام الدفع</h3><button onclick="closeCheckout()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black">×</button></div><div id="checkoutSummary" class="mt-4 rounded-2xl bg-neutral-50 p-4 text-sm leading-6"></div><label class="block mt-4"><span class="text-xs font-black text-neutral-500">اسم المحوّل</span><input id="payerName" maxlength="120" class="mt-2 w-full rounded-2xl bg-neutral-100 px-4 py-3 outline-none focus:ring-2 focus:ring-neutral-900 font-bold" placeholder="مثال: هلا نايف المشاقبة"></label><button id="submitCheckoutBtn" onclick="submitCheckout()" class="mt-4 w-full min-h-[52px] rounded-2xl bg-neutral-950 text-white font-black">أرسلت التحويل — أرسل الطلب</button><div id="checkoutStatus" class="mt-3 rounded-2xl bg-neutral-50 p-4 text-sm"></div></div></div>
+  <div id="accountModal" class="hidden fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"><div class="w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-[2rem] bg-white p-6"><div class="flex items-center justify-between"><div><div class="text-xs text-neutral-400 font-black">حسابي</div><h3 id="accountName" class="text-2xl font-black"></h3></div><button onclick="closeAccount()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black">×</button></div><button onclick="loadOrders()" class="mt-4 rounded-xl bg-neutral-100 px-4 py-2 font-black">تحديث الطلبات</button><div id="ordersBox" class="mt-4 space-y-3"></div><button onclick="logoutUser()" class="mt-4 rounded-xl bg-red-50 text-red-700 px-4 py-2 font-black">تسجيل الخروج</button></div></div>
+  <div id="suggestModal" class="hidden fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"><div class="w-full max-w-md rounded-[2rem] bg-white p-6"><div class="flex items-center justify-between"><h3 class="text-2xl font-black">صندوق الاقتراحات</h3><button onclick="closeSuggestion()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black">×</button></div><textarea id="suggestionText" rows="5" maxlength="1000" class="mt-4 w-full rounded-2xl bg-neutral-100 px-4 py-3 outline-none focus:ring-2 focus:ring-neutral-900 font-bold" placeholder="ما الذي تريدين تحسينه أو إضافته؟"></textarea><button onclick="sendSuggestion()" class="mt-4 w-full min-h-[50px] rounded-2xl bg-neutral-950 text-white font-black">إرسال الاقتراح</button><div id="suggestMsg" class="mt-3 text-sm"></div></div></div>
   <script>
 const form = document.getElementById('searchForm');
 const refineForm = document.getElementById('refineForm');
@@ -1666,6 +2148,13 @@ let activeCard = null;
 let activeDealId = null;
 let dealPoll = null;
 let paidDeals = {};
+let authToken = localStorage.getItem('tawseya_auth') || '';
+let currentUser = null;
+let authMode = 'login';
+let activeBatchId = null;
+let pendingCartOfferId = null;
+let orderPoll = null;
+let knownOrderStatuses = {};
 let sessionId = null;
 
 const EX = [
@@ -1722,10 +2211,45 @@ const tags = (item.tags || []).slice(0, 5).map(tag => `<span class="rounded-full
 const reasons = (item.reasons || []).slice(0, 3).map(r => `<li class="flex items-start gap-1.5 text-[11px] text-emerald-700 font-bold leading-5"><span class="mt-0.5">✓</span><span>${esc(r)}</span></li>`).join('');
 const knownDeal = paidDeals[String(item.id)];
 const zone = knownDeal ? `<div class="flex gap-2">${protectedButtons(knownDeal)}</div>` : lockedZone();
-return ` <article data-offer-id="${item.id}" class="group bg-white rounded-[2rem] border border-neutral-200/70 overflow-hidden soft-shadow flex flex-col"><div class="relative aspect-[4/5] overflow-hidden bg-neutral-100"><img src="${esc(item.image_url)}" loading="lazy" referrerpolicy="no-referrer" class="h-full w-full object-cover transition duration-700 group-hover:scale-[1.03]" alt="${esc(item.title)}" onerror="this.style.opacity='.18'" /><div class="absolute inset-x-3 top-3 flex items-start justify-between gap-2"><span class="rounded-full bg-white/90 backdrop-blur px-3 py-1.5 text-[10px] font-black shadow-sm">${score}% توافق</span><span class="rounded-full bg-black/65 text-white backdrop-blur px-3 py-1.5 text-[10px] font-bold">${esc(item.match_type || 'توصية')}</span></div></div><div class="p-4 sm:p-5 flex-1 flex flex-col"><div class="flex items-center justify-between gap-2"><span class="text-[11px] text-neutral-400 font-black">${esc(categoryNames[item.category] || item.category)}</span><span class="text-[11px] text-neutral-400 font-bold">${esc(item.city)}</span></div><h4 class="mt-2 text-sm sm:text-base font-black leading-6">${esc(item.title)}</h4><div class="mt-1 text-xs text-neutral-400 font-bold">${esc(item.merchant_name)}</div><p class="mt-2 text-xs sm:text-sm text-neutral-500 leading-6">${esc(item.description)}</p><ul class="mt-3 space-y-1">${reasons}</ul><div class="mt-3 flex flex-wrap gap-1.5">${tags}</div><div class="mt-auto pt-4 flex items-end justify-between gap-3"><div><div class="text-[10px] text-neutral-400 font-bold">السعر</div><div class="text-lg font-black">${esc(money(item.price_jod))}</div></div><button type="button" onclick='openDeal(${JSON.stringify({id:item.id,title:item.title,price_jod:item.price_jod})})' class="min-h-[48px] px-4 rounded-2xl bg-neutral-950 hover:bg-neutral-800 text-white font-black text-xs sm:text-sm transition active:scale-[0.985]">${knownDeal ? 'فتح الإعلان' : 'افتحي الصفقة'} <span class="opacity-60">(1 دينار)</span></button></div><div class="contact-zone relative mt-4 p-2 rounded-2xl border border-neutral-100 ${knownDeal ? '' : 'hide-links'}" data-card="${index}">${zone}</div></div></article>`;
+return ` <article data-offer-id="${item.id}" class="group bg-white rounded-[2rem] border border-neutral-200/70 overflow-hidden soft-shadow flex flex-col"><div class="relative aspect-[4/5] overflow-hidden bg-neutral-100"><img src="${esc(item.image_url)}" loading="lazy" referrerpolicy="no-referrer" class="h-full w-full object-cover transition duration-700 group-hover:scale-[1.03]" alt="${esc(item.title)}" onerror="this.style.opacity='.18'" /><div class="absolute inset-x-3 top-3 flex items-start justify-between gap-2"><span class="rounded-full bg-white/90 backdrop-blur px-3 py-1.5 text-[10px] font-black shadow-sm">${score}% توافق</span><span class="rounded-full bg-black/65 text-white backdrop-blur px-3 py-1.5 text-[10px] font-bold">${esc(item.match_type || 'توصية')}</span></div></div><div class="p-4 sm:p-5 flex-1 flex flex-col"><div class="flex items-center justify-between gap-2"><span class="text-[11px] text-neutral-400 font-black">${esc(categoryNames[item.category] || item.category)}</span><span class="text-[11px] text-neutral-400 font-bold">${esc(item.city)}</span></div><h4 class="mt-2 text-sm sm:text-base font-black leading-6">${esc(item.title)}</h4><div class="mt-1 text-xs text-neutral-400 font-bold">${esc(item.merchant_name)}</div><p class="mt-2 text-xs sm:text-sm text-neutral-500 leading-6">${esc(item.description)}</p><ul class="mt-3 space-y-1">${reasons}</ul><div class="mt-3 flex flex-wrap gap-1.5">${tags}</div><div class="mt-auto pt-4 flex items-end justify-between gap-3"><div><div class="text-[10px] text-neutral-400 font-bold">السعر</div><div class="text-lg font-black">${esc(money(item.price_jod))}</div></div><button type="button" onclick='openDeal(${JSON.stringify({id:item.id,title:item.title,price_jod:item.price_jod})})' class="min-h-[48px] px-4 rounded-2xl bg-neutral-950 hover:bg-neutral-800 text-white font-black text-xs sm:text-sm transition active:scale-[0.985]">إضافة للسلة <span class="opacity-60">(1 د)</span></button></div><div class="contact-zone relative mt-4 p-2 rounded-2xl border border-neutral-100 ${knownDeal ? '' : 'hide-links'}" data-card="${index}">${zone}</div></div></article>`;
 }
 
-async function openDeal(item) {
+async function addToCart(item){
+if(!authToken){pendingCartOfferId=Number(item.id);openAuth('register');return;}
+try{const r=await fetch('/api/cart/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:authToken,offer_id:Number(item.id)})});const d=await r.json();if(!r.ok)throw new Error(d.error||'تعذر إضافة الإعلان');updateCartUI(d);showToast('تمت إضافة الإعلان إلى السلة.');}catch(e){alert(e.message);}}
+async function updateCartUI(data){const badge=document.getElementById('cartBadge');if(data.count){badge.textContent=data.count;badge.classList.remove('hidden');}else badge.classList.add('hidden');}
+async function openCart(){if(!authToken){openAuth('login');return;}try{const d=await apiPublic('/api/cart/get',{token:authToken});renderCart(d);document.getElementById('cartModal').classList.remove('hidden');}catch(e){alert(e.message);}}
+function closeCart(){document.getElementById('cartModal').classList.add('hidden');}
+async function apiPublic(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw new Error(d.error||'حدث خطأ');return d;}
+function renderCart(d){updateCartUI(d);document.getElementById('cartTotal').textContent=`${d.total_jod} د.أ`;document.getElementById('cartItems').innerHTML=d.items.length?d.items.map(x=>`<div class="flex items-center justify-between gap-3 rounded-2xl border p-3"><div><div class="font-black">${esc(x.title)}</div><div class="text-xs text-neutral-400">${esc(x.merchant_name)}</div></div><button onclick="removeCart(${x.id})" class="rounded-xl bg-red-50 text-red-700 px-3 py-2 font-black text-xs">حذف</button></div>`).join(''):'<div class="rounded-2xl bg-neutral-50 p-5 text-sm text-neutral-500">السلة فارغة.</div>';}
+async function removeCart(id){try{const d=await apiPublic('/api/cart/remove',{token:authToken,offer_id:id});renderCart(d);}catch(e){alert(e.message);}}
+function openAuth(mode='login'){authMode=mode;renderAuth();document.getElementById('authModal').classList.remove('hidden');}
+function closeAuth(){document.getElementById('authModal').classList.add('hidden');}
+function switchAuth(mode){authMode=mode;renderAuth();}
+function renderAuth(){document.getElementById('authForm').innerHTML=authMode==='login'?`<input id="authPhone" class="w-full rounded-xl bg-neutral-100 px-4 py-3 font-bold" placeholder="رقم الهاتف"><input id="authPassword" type="password" class="w-full rounded-xl bg-neutral-100 px-4 py-3 font-bold" placeholder="كلمة المرور"><button onclick="submitAuth()" class="w-full rounded-xl bg-neutral-950 text-white py-3 font-black">دخول</button>`:`<input id="authName" class="w-full rounded-xl bg-neutral-100 px-4 py-3 font-bold" placeholder="الاسم"><input id="authPhone" class="w-full rounded-xl bg-neutral-100 px-4 py-3 font-bold" placeholder="رقم الهاتف"><input id="authPassword" type="password" class="w-full rounded-xl bg-neutral-100 px-4 py-3 font-bold" placeholder="كلمة المرور (6 أحرف على الأقل)"><button onclick="submitAuth()" class="w-full rounded-xl bg-neutral-950 text-white py-3 font-black">إنشاء الحساب</button>`;}
+async function submitAuth(){try{const body=authMode==='login'?{phone:document.getElementById('authPhone').value,password:document.getElementById('authPassword').value}:{full_name:document.getElementById('authName').value,phone:document.getElementById('authPhone').value,password:document.getElementById('authPassword').value};const d=await apiPublic(authMode==='login'?'/api/auth/login':'/api/auth/register',body);authToken=d.token;currentUser=d.user;localStorage.setItem('tawseya_auth',authToken);document.getElementById('authMsg').textContent='تم الدخول بنجاح.';document.getElementById('authMsg').className='text-sm mt-3 text-emerald-700 font-bold';updateAccountBtn();const pending=pendingCartOfferId;pendingCartOfferId=null;setTimeout(async()=>{closeAuth();if(pending){try{const c=await apiPublic('/api/cart/add',{token:authToken,offer_id:pending});updateCartUI(c);openCart();}catch(e){alert(e.message);}}},400);loadCartSafe();}catch(e){document.getElementById('authMsg').textContent=e.message;document.getElementById('authMsg').className='text-sm mt-3 text-red-600 font-bold';}}
+async function initAuth(){if(!authToken){updateAccountBtn();return;}try{const d=await apiPublic('/api/auth/me',{token:authToken});currentUser=d.user;updateAccountBtn();await loadCartSafe();}catch(_){authToken='';localStorage.removeItem('tawseya_auth');updateAccountBtn();}}
+function updateAccountBtn(){const b=document.getElementById('accountBtn');b.textContent=currentUser?`حسابي: ${currentUser.full_name.split(' ')[0]}`:'تسجيل الدخول';}
+async function loadCartSafe(){try{const d=await apiPublic('/api/cart/get',{token:authToken});updateCartUI(d);}catch(_){}}
+async function openAccount(){if(!authToken){openAuth('login');return;}try{const d=await apiPublic('/api/auth/me',{token:authToken});currentUser=d.user;updateAccountBtn();renderOrders(d.orders);document.getElementById('accountModal').classList.remove('hidden');startOrderPolling();}catch(e){alert(e.message);}}
+function closeAccount(){stopOrderPolling();document.getElementById('accountModal').classList.add('hidden');}
+function statusLabel(s){return {draft:'مسودة',payment_submitted:'قيد التحقق',paid:'تم التحقق',rejected:'مرفوض'}[s]||s;}
+function renderOrders(orders){const box=document.getElementById('ordersBox');document.getElementById('accountName').textContent=currentUser?currentUser.full_name:'';box.innerHTML=orders.length?orders.map(o=>`<article class="rounded-2xl border p-4"><div class="flex items-center justify-between gap-3"><div class="font-black">طلب ${esc(o.batch_id.slice(0,8))}</div><span class="rounded-full ${o.status==='paid'?'bg-emerald-100 text-emerald-700':o.status==='rejected'?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'} px-3 py-1 text-xs font-black">${statusLabel(o.status)}</span></div><div class="mt-2 text-sm">المبلغ: <b>${esc(o.total_jod)} د.أ</b> · عدد الإعلانات: <b>${esc(o.item_count)}</b>${o.payer_name?` · اسم المحوّل: <b>${esc(o.payer_name)}</b>`:''}</div>${o.status==='paid'?`<div class="mt-3 grid gap-2">${o.items.map(i=>`<div class="rounded-xl bg-emerald-50 p-3"><div class="font-black">${esc(i.title)}</div><div class="mt-2 flex flex-wrap gap-2"><button onclick="openPaid('${esc(i.deal_id)}','store')" class="rounded-xl bg-neutral-950 text-white px-3 py-2 font-black text-xs">فتح المتجر</button><button onclick="openPaid('${esc(i.deal_id)}','whatsapp')" class="rounded-xl bg-white px-3 py-2 font-black text-xs">واتساب</button><button onclick="openPaid('${esc(i.deal_id)}','instagram')" class="rounded-xl bg-white px-3 py-2 font-black text-xs">إنستغرام</button></div></div>`).join('')}</div>`:'<div class="mt-3 text-sm text-neutral-500">بعد اعتماد التحويل ستظهر روابط هذه الطلبات هنا تلقائيًا.</div>'}</article>`).join(''):'<div class="rounded-2xl bg-neutral-50 p-5 text-sm text-neutral-500">لا توجد طلبات بعد.</div>';}
+async function loadOrders(){try{const d=await apiPublic('/api/orders',{token:authToken});let becamePaid=false;for(const o of d.orders){if(knownOrderStatuses[o.batch_id]&&knownOrderStatuses[o.batch_id]!=="paid"&&o.status==="paid")becamePaid=true;knownOrderStatuses[o.batch_id]=o.status;}renderOrders(d.orders);if(becamePaid){document.getElementById('accountModal').classList.remove('hidden');showToast('✅ تم التحقق من الدفع. طلباتك أصبحت جاهزة للفتح.');}}catch(e){if(e.message)console.warn(e.message);}}
+function startOrderPolling(){stopOrderPolling();let attempts=0;orderPoll=setInterval(async()=>{attempts++;await loadOrders();if(attempts>60)stopOrderPolling();},5000);}
+function stopOrderPolling(){if(orderPoll){clearInterval(orderPoll);orderPoll=null;}}
+async function openPaid(dealId,channel){try{const d=await apiPublic('/api/deal/open',{token:authToken,deal_id:dealId,session_id:'',channel});window.open(d.url,'_blank','noopener');}catch(e){alert(e.message);}}
+function logoutUser(){authToken='';currentUser=null;localStorage.removeItem('tawseya_auth');updateAccountBtn();closeAccount();loadCartSafe();}
+async function startCheckoutFlow(){if(!authToken){closeCart();openAuth('login');return;}try{const d=await apiPublic('/api/checkout/start',{token:authToken});activeBatchId=d.batch.batch_id;document.getElementById('checkoutSummary').innerHTML=`سيتم إرسال <b>${d.batch.item_count}</b> طلبات بقيمة <b>${d.batch.total_jod} د.أ</b> إجمالًا. بعد التحويل اكتبي الاسم الذي ظهر في إشعار البنك.`;document.getElementById('checkoutStatus').textContent='';document.getElementById('checkoutModal').classList.remove('hidden');closeCart();}catch(e){alert(e.message);}}
+function closeCheckout(){document.getElementById('checkoutModal').classList.add('hidden');}
+async function submitCheckout(){if(!activeBatchId)return;const name=document.getElementById('payerName').value.trim();if(!name){alert('اكتبي اسم المحوّل.');return;}const btn=document.getElementById('submitCheckoutBtn');btn.disabled=true;try{const d=await apiPublic('/api/checkout/submit',{token:authToken,batch_id:activeBatchId,payer_name:name});document.getElementById('checkoutStatus').innerHTML='<span class="text-amber-700 font-black">تم إرسال الطلب. سننتظر التحقق من التحويل.</span><br>يمكنك إغلاق هذه النافذة والعودة لاحقًا من «حسابي > طلباتي».';startOrderPolling();setTimeout(()=>closeCheckout(),800);loadOrders();}catch(e){document.getElementById('checkoutStatus').textContent=e.message;}finally{btn.disabled=false;}}
+function openSuggestion(){document.getElementById('suggestModal').classList.remove('hidden');}
+function closeSuggestion(){document.getElementById('suggestModal').classList.add('hidden');}
+async function sendSuggestion(){try{await apiPublic('/api/suggestions',{token:authToken,message:document.getElementById('suggestionText').value});document.getElementById('suggestMsg').textContent='تم إرسال اقتراحك.';document.getElementById('suggestionText').value='';}catch(e){document.getElementById('suggestMsg').textContent=e.message;}}
+function showToast(message){const t=document.createElement('div');t.textContent=message;t.className='fixed bottom-5 left-1/2 -translate-x-1/2 z-[80] rounded-full bg-neutral-950 text-white px-4 py-3 text-sm font-black shadow-xl';document.body.appendChild(t);setTimeout(()=>t.remove(),1800);}
+
+async function openDeal(item) { return addToCart(item); }
+async function legacyOpenDeal(item) {
 if (!sessionId) { alert('أرسلي طلب البحث أولاً.'); return; }
 activeCard = item;
 activeDealId = null;
@@ -1766,7 +2290,7 @@ function startDealPolling(){stopDealPolling();let attempts=0;dealPoll=setInterva
 function stopDealPolling(){if(dealPoll){clearInterval(dealPoll);dealPoll=null;}}
 async function openProtectedLink(dealId, channel){
 if(!sessionId) return;
-try{const r=await fetch('/api/deal/open',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,deal_id:dealId,channel})});const d=await r.json();if(!r.ok)throw new Error(d.error||'هذا الرابط غير متاح');window.open(d.url,'_blank','noopener');}catch(e){alert(e.message);}}
+try{const r=await fetch('/api/deal/open',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,deal_id:dealId,channel,token:authToken})});const d=await r.json();if(!r.ok)throw new Error(d.error||'هذا الرابط غير متاح');window.open(d.url,'_blank','noopener');}catch(e){alert(e.message);}}
 function closeDealModal(){stopDealPolling();dealModal.classList.add('hidden');document.body.classList.remove('overflow-hidden');}
 dealModal.addEventListener('click',(event)=>{if(event.target===dealModal)closeDealModal();});
 document.addEventListener('keydown',(event)=>{if(event.key==='Escape'&&!dealModal.classList.contains('hidden'))closeDealModal();});
@@ -1808,7 +2332,7 @@ setBusy(true);
 try {
 const response = await fetch('/api/recommend', {
 method: 'POST', headers: {'Content-Type':'application/json'},
-body: JSON.stringify({query})
+body: JSON.stringify({query, token: authToken})
 });
 const data = await response.json();
 if (!response.ok) throw new Error(data.error || 'تعذر إتمام البحث');
@@ -1829,7 +2353,7 @@ setBusy(true);
 try {
 const response = await fetch('/api/refine', {
 method: 'POST', headers: {'Content-Type':'application/json'},
-body: JSON.stringify({session_id: sessionId, message})
+body: JSON.stringify({session_id: sessionId, message, token: authToken})
 });
 const data = await response.json();
 if (!response.ok) throw new Error(data.error || 'تعذر تحديث الطلب');
@@ -1840,6 +2364,7 @@ renderError(error.message);
 } finally { setBusy(false); }
 });
 
+initAuth();
 queryEl.focus();
   </script>
 </body>
@@ -1870,13 +2395,13 @@ def _intent_public(intent: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _recommend_payload(intent: Dict[str, Any], request_id: str, session_id: str) -> Dict[str, Any]:
+def _recommend_payload(intent: Dict[str, Any], request_id: str, session_id: str, raw_query: str = "") -> Dict[str, Any]:
     return {
         "ok": True,
         "request_id": request_id,
         "session_id": session_id,
         "intent": _intent_public(intent),
-        "results": recommend(intent),
+        "results": recommend(intent, raw_query),
         "payment": PAYMENT_PROVIDER.instructions(),
     }
 
@@ -1928,7 +2453,7 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 return respond({
                     "ok": True,
                     "service": "التوصية",
-                    "version": "2.0",
+                    "version": "3.0",
                     "port": PORT,
                     "inventory_count": len(SEED_OFFERS),
                     "gemini_enabled": bool(gemini_model()),
@@ -1946,11 +2471,104 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
             if not isinstance(data, dict):
                 return respond({"error": "تنسيق الطلب غير صالح"}, 400)
 
+            if path == "/api/auth/register":
+                try:
+                    token = register_user(str(data.get("full_name", "")), str(data.get("phone", "")), str(data.get("password", "")))
+                except ValueError as exc:
+                    return respond({"error": str(exc)}, 400)
+                user = get_user_from_token(token)
+                return respond({"ok": True, "token": token, "user": {"id": user["id"], "full_name": user["full_name"], "phone": user["phone"]}})
+
+            if path == "/api/auth/login":
+                try:
+                    token = login_user(str(data.get("phone", "")), str(data.get("password", "")))
+                except ValueError as exc:
+                    return respond({"error": str(exc)}, 401)
+                user = get_user_from_token(token)
+                return respond({"ok": True, "token": token, "user": {"id": user["id"], "full_name": user["full_name"], "phone": user["phone"]}})
+
+            if path == "/api/auth/me":
+                user = get_user_from_token(str(data.get("token", "")))
+                if not user: return respond({"error": "الجلسة منتهية. سجلي الدخول من جديد."}, 401)
+                return respond({"ok": True, "user": {"id": user["id"], "full_name": user["full_name"], "phone": user["phone"]}, "orders": list_user_batches(int(user["id"]))})
+
+            if path == "/api/cart/get":
+                user = get_user_from_token(str(data.get("token", "")))
+                if not user: return respond({"error":"يلزم تسجيل الدخول."},401)
+                return respond({"ok":True, **get_user_cart(int(user["id"]))})
+
+            if path == "/api/cart/add":
+                user = get_user_from_token(str(data.get("token", "")))
+                if not user: return respond({"error":"سجلي الدخول أولًا حتى نحفظ السلة والطلبات."},401)
+                try: offer_id=int(data.get("offer_id",0)); cart=add_to_cart(int(user["id"]),offer_id)
+                except ValueError as exc: return respond({"error":str(exc)},400)
+                return respond({"ok":True, **cart})
+
+            if path == "/api/cart/remove":
+                user = get_user_from_token(str(data.get("token", "")))
+                if not user: return respond({"error":"يلزم تسجيل الدخول."},401)
+                try: offer_id=int(data.get("offer_id",0)); cart=remove_from_cart(int(user["id"]),offer_id)
+                except ValueError as exc: return respond({"error":str(exc)},400)
+                return respond({"ok":True, **cart})
+
+            if path == "/api/checkout/start":
+                user = get_user_from_token(str(data.get("token", "")))
+                if not user: return respond({"error":"سجلي الدخول أولًا."},401)
+                try: batch=start_checkout(int(user["id"]))
+                except ValueError as exc: return respond({"error":str(exc)},400)
+                return respond({"ok":True,"batch":batch,"payment":PAYMENT_PROVIDER.instructions()})
+
+            if path == "/api/checkout/submit":
+                user = get_user_from_token(str(data.get("token", "")))
+                if not user: return respond({"error":"يلزم تسجيل الدخول."},401)
+                try: batch=submit_checkout(int(user["id"]), str(data.get("batch_id","")).strip(), str(data.get("payer_name","")).strip())
+                except ValueError as exc: return respond({"error":str(exc)},400)
+                return respond({"ok":True,"batch":batch})
+
+            if path == "/api/orders":
+                user = get_user_from_token(str(data.get("token", "")))
+                if not user: return respond({"error":"يلزم تسجيل الدخول."},401)
+                return respond({"ok":True,"orders":list_user_batches(int(user["id"]))})
+
+            if path == "/api/payments/incoming":
+                secret = str(data.get("secret", ""))
+                if not PAYMENT_WEBHOOK_SECRET or not hmac.compare_digest(secret, PAYMENT_WEBHOOK_SECRET):
+                    return respond({"error":"غير مصرح."}, 401)
+                try:
+                    event=process_incoming_payment(str(data.get("external_id","")), str(data.get("payer_name","")), float(data.get("amount_jod",0)), str(data.get("raw_message","")))
+                except ValueError as exc:
+                    return respond({"error":str(exc)},400)
+                return respond({"ok":True,"event":event})
+
+            if path == "/api/suggestions":
+                token=str(data.get("token", "")); user=get_user_from_token(token)
+                try: save_suggestion(int(user["id"]) if user else None, str(data.get("message", "")))
+                except ValueError as exc: return respond({"error":str(exc)},400)
+                return respond({"ok":True})
+
             if path == "/api/admin/login":
                 password = str(data.get("password", ""))
                 if not _admin_ok(password):
                     return respond({"error": "كلمة مرور الإدارة غير صحيحة."}, 401)
                 return respond({"ok": True})
+
+            if path == "/api/admin/pending-batches":
+                password = str(data.get("password", ""))
+                if not _admin_ok(password): return respond({"error":"غير مصرح."},401)
+                return respond({"ok":True,"batches":list_pending_batches()})
+
+            if path == "/api/admin/batch-decision":
+                password = str(data.get("password", ""))
+                if not _admin_ok(password): return respond({"error":"غير مصرح."},401)
+                batch_id=str(data.get("batch_id","")).strip(); action=str(data.get("action","")).strip()
+                if action not in {"paid","rejected"} or not batch_id: return respond({"error":"بيانات القرار غير صالحة."},400)
+                if not set_batch_status(batch_id, action): return respond({"error":"الدفعة غير موجودة."},404)
+                return respond({"ok":True,"status":action})
+
+            if path == "/api/admin/suggestions":
+                password = str(data.get("password", ""))
+                if not _admin_ok(password): return respond({"error":"غير مصرح."},401)
+                return respond({"ok":True,"suggestions":list_suggestions()})
 
             if path == "/api/admin/pending":
                 password = str(data.get("password", ""))
@@ -1982,7 +2600,7 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                     return respond({"error": "غير مصرح."}, 401)
                 try:
                     offer_id = int(data.get("offer_id", 0))
-                    ok = update_offer_links(offer_id, str(data.get("whatsapp_url", "")), str(data.get("instagram_url", "")), str(data.get("image_url", "")))
+                    ok = update_offer_links(offer_id, str(data.get("store_url", "")), str(data.get("whatsapp_url", "")), str(data.get("instagram_url", "")), str(data.get("image_url", "")))
                 except (ValueError, TypeError) as exc:
                     return respond({"error": str(exc)}, 400)
                 if not ok:
@@ -2019,16 +2637,22 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
             if path == "/api/deal/open":
                 session_id = str(data.get("session_id", "")).strip()
                 deal_id = str(data.get("deal_id", "")).strip()
+                token = str(data.get("token", "")).strip()
                 channel = str(data.get("channel", "")).strip().lower()
-                if channel not in {"whatsapp", "instagram"}:
+                if channel not in {"store", "whatsapp", "instagram"}:
                     return respond({"error": "نوع الرابط غير صالح."}, 400)
-                row = deal_status_for_session(deal_id, session_id)
+                user = get_user_from_token(token)
+                row = get_deal(deal_id)
+                if user and row and row["user_id"] == int(user["id"]):
+                    pass
+                else:
+                    row = deal_status_for_session(deal_id, session_id)
                 if not row or row["status"] != "paid":
                     return respond({"error": "يجب التحقق من الدفع لهذا الإعلان أولاً."}, 402)
                 offer = get_offer_by_id(int(row["offer_id"]))
                 if offer is None:
                     return respond({"error": "الإعلان غير موجود."}, 404)
-                url = offer.whatsapp_url if channel == "whatsapp" else offer.instagram_url
+                url = offer.store_url if channel == "store" else (offer.whatsapp_url if channel == "whatsapp" else offer.instagram_url)
                 parsed = urlparse(url)
                 if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                     return respond({"error": "رابط المتجر لهذا الإعلان غير مُضاف أو غير صالح. حدّثيه من لوحة الإدارة."}, 400)
@@ -2045,8 +2669,9 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 session_id = uuid.uuid4().hex
                 intent = extract_intent(query, use_ai=True)
                 save_buyer_intent(request_id, query, intent)
-                create_session(session_id, intent, client_ip)
-                return respond(_recommend_payload(intent, request_id, session_id))
+                user = get_user_from_token(str(data.get("token", "")))
+                create_session(session_id, intent, client_ip, int(user["id"]) if user else None, query)
+                return respond(_recommend_payload(intent, request_id, session_id, query))
 
             if path == "/api/refine":
                 session_id = str(data.get("session_id", "")).strip()
@@ -2059,10 +2684,13 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 if prev is None:
                     return respond({"error": "الجلسة غير موجودة أو انتهت. أعيدي إرسال الطلب من جديد."}, 404)
                 intent = refine_intent(prev, message)
+                meta = get_session_meta(session_id)
+                raw_query = ((meta["raw_query"] if meta and "raw_query" in meta.keys() else "") + " " + message).strip()
                 request_id = uuid.uuid4().hex
                 save_buyer_intent(request_id, f"[refine] {message}", intent)
-                create_session(session_id, intent, client_ip)
-                return respond(_recommend_payload(intent, request_id, session_id))
+                user = get_user_from_token(str(data.get("token", "")))
+                create_session(session_id, intent, client_ip, int(user["id"]) if user else (int(meta["user_id"]) if meta and meta["user_id"] else None), raw_query)
+                return respond(_recommend_payload(intent, request_id, session_id, raw_query))
 
             return respond({"error": "Not Found"}, 404)
 
@@ -2142,7 +2770,7 @@ def application(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
 def main() -> None:
     init_db()
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
-    LOGGER.info("التوصية v2 تعمل على http://%s:%d", HOST, PORT)
+    LOGGER.info("التوصية v3 تعمل على http://%s:%d", HOST, PORT)
     LOGGER.info("Inventory seeded: %d offers", len(SEED_OFFERS))
     if GOOGLE_API_KEY and genai:
         LOGGER.info("Gemini extraction enabled with model=%s", GEMINI_MODEL)
