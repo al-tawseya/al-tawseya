@@ -1202,21 +1202,16 @@ class AppHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     init_db()
-    server = ThreadingHTTPServer((HOST, PORT), AppHandler)
-    LOGGER.info("التوصية تعمل على http://%s:%d", HOST, PORT)
-    LOGGER.info("Inventory seeded: %d offers", len(SEED_OFFERS))
-    if GOOGLE_API_KEY and genai:
-        LOGGER.info("Gemini extraction enabled with model=%s", GEMINI_MODEL)
-    else:
-        LOGGER.info("Gemini extraction disabled; deterministic local Arabic parser is active")
+   if __name__ == "__main__":
+    # جلب المنفذ الصحيح تلقائياً من منصة Render السحابية
+    import os
+    port = int(os.environ.get("PORT", 10000))
+    
+    # تشغيل السيرفر بالإعدادات المتوافقة مع المنصة
+    server = HTTPServer(("0.0.0.0", port), AppHandler)
+    print(f"🚀 Live Server Running Perfectly on Port {port}")
+    
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
-        LOGGER.info("Stopping server")
-
-if __name__ == "__main__":
-    # حقن المنفذ السحابي الصريح لـ Render لتجاوز فحص الـ Port Scan بنجاح
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), EnterpriseWebHandler)
-    print(f"🚀 Live Server Running Perfectly on Port {port}")
-    server.serve_forever()
+        pass
