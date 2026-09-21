@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 try:
     import google.generativeai as genai  # type: ignore
@@ -1912,9 +1912,9 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 return 200, headers + [("Content-Type", ADMIN_HTML_CONTENT_TYPE)], _admin_page().encode("utf-8")
             if path.startswith("/api/deal/status"):
                 parsed = urlparse(path)
-                params = dict(item.split("=", 1) for item in parsed.query.split("&") if "=" in item)
-                session_id = params.get("session_id", "")
-                deal_id = params.get("deal_id", "")
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                session_id = query.get("session_id", [""])[0]
+                deal_id = query.get("deal_id", [""])[0]
                 row = deal_status_for_session(deal_id, session_id)
                 if not row:
                     return respond({"error": "طلب الدفع غير موجود."}, 404)
@@ -2123,6 +2123,9 @@ class AppHandler(BaseHTTPRequestHandler):
 def application(environ: Dict[str, Any], start_response: Any) -> List[bytes]:
     method = environ.get("REQUEST_METHOD", "GET").upper()
     path = environ.get("PATH_INFO", "/") or "/"
+    query_string = environ.get("QUERY_STRING", "") or ""
+    if query_string:
+        path = f"{path}?{query_string}"
     try:
         length = int(environ.get("CONTENT_LENGTH") or 0)
     except (TypeError, ValueError):
