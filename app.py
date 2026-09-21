@@ -784,8 +784,9 @@ def extract_intent(user_text: str, use_ai: bool = True) -> Dict[str, Any]:
 
 def refine_intent(prev: Dict[str, Any], new_text: str) -> Dict[str, Any]:
     new = extract_intent(new_text, use_ai=True)
-    merged: Dict[str, Any] = {k: (list(v) if isinstance(v, list) else v) for k, v in prev.items()}
-    t = normalize_text(new_text)
+               if path in ("/", "/index.html"):
+                page = HTML_TEMPLATE.replace("__PAYMENT_BANK_AR__", html.escape(PAYMENT_BANK_AR))
+
 
     if re.search(r"ارخص|أرخص|orخص", t):
         merged["priority"] = "cheapest"
