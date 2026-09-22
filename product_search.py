@@ -350,6 +350,42 @@ class WebSearchEngine:
                 urls = [x.get("url") for x in sources if x.get("url")]
                 urls.extend(re.findall(r"https?://\S+", text_response))
 
+                # Rescue discovery when grounding metadata does not expose URLs.
+                if not urls:
+                    rescue_prompt = f"""
+نفّذ Google Search الآن للطلب التالي: {user_text!r}
+استعلام البحث الحالي: {query!r}
+
+أعد JSON فقط:
+{{"urls":[{{"url":"https://...","title":"اسم المنتج أو الصفحة"}}]}}
+
+القواعد:
+- روابط حقيقية ظهرت في البحث فقط.
+- صفحات منتجات قابلة للشراء قدر الإمكان.
+- لا صفحات رئيسية أو صفحات نتائج بحث إذا توجد صفحة منتج.
+- لا تخترع أي رابط.
+- الأولوية لمتاجر الأردن ثم المتاجر التي تشحن للأردن.
+"""
+                    try:
+                        rescue = client.models.generate_content(
+                            model=self.deps.model_name,
+                            contents=rescue_prompt,
+                            config=genai_types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+                                temperature=0.1,
+                            ),
+                        )
+                        rescue_data = json.loads(getattr(rescue, "text", "") or "{}")
+                        if isinstance(rescue_data, dict):
+                            for item in rescue_data.get("urls", []):
+                                if isinstance(item, dict) and item.get("url"):
+                                    urls.append(str(item["url"]))
+                                    sources.append({"url": str(item["url"]), "title": str(item.get("title") or "")})
+                    except Exception as rescue_exc:
+                        errors.append(f"rescue_{rank}:{type(rescue_exc).__name__}")
+                        LOGGER.warning("Structured discovery rescue failed for query %s: %s", rank, rescue_exc)
+
                 for source_rank, url in enumerate(urls, start=1):
                     url = canonicalize_url(url)
                     if not url or url in avoid or url in seen:
@@ -706,7 +742,8 @@ class ProductVerifier:
     def verify_match(self, product: Dict[str, Any], user_text: str, intent: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         title = normalize_text(product.get("title"))
         description = normalize_text(product.get("description"))
-        body = f"{title} {description} {normalize_text(product.get('category'))}"
+        discovery_text = normalize_text(f"{product.get('grounding_title','')} {product.get('search_query','')}")
+        body = f"{title} {description} {normalize_text(product.get('category'))} {discovery_text}"
         categories = list(intent.get("categories", []))
         terms = normalized_terms(list(intent.get("product_terms", [])) + list(intent.get("synonyms", [])))
 
@@ -1078,6 +1115,8 @@ class ProductSearchEngine:
             product["verified_at"] = time.time()
             product["search_rank"] = candidate.get("search_rank", 999999)
             product["source_url"] = candidate.get("source_url")
+            product["grounding_title"] = candidate.get("grounding_title", "")
+            product["search_query"] = candidate.get("search_query", "")
             product["verification_status"] = "verified"
 
             ok, reason = self.verifier.verify_match(product, user_text, enriched)
@@ -1114,6 +1153,8 @@ class ProductSearchEngine:
             item["size_system"] = (enriched.get("sizes") or {}).get("system") or ""
             item["store_url"] = item.get("store_url") or item.get("canonical_url")
             item.pop("canonical_url", None)
+            item.pop("grounding_title", None)
+            item.pop("search_query", None)
             # Payload must not expose internal debug-only fields.
             item.pop("search_rank", None)
 
