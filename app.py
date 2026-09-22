@@ -891,7 +891,7 @@ def fetch_product_metadata(page_url: str) -> Dict[str, Any]:
     if not page_url:
         return {}
     try:
-        req = urllib.request.Request(page_url, headers={"User-Agent": "Mozilla/5.0 AlTawseyaSearch/8.0"})
+        req = urllib.request.Request(page_url, headers={"User-Agent": "Mozilla/5.0 AlTawseyaSearch/9.0"})
         with urllib.request.urlopen(req, timeout=7) as resp:
             final_url = normalize_external_url(resp.geturl())
             content_type = (resp.headers.get("Content-Type") or "").lower()
@@ -969,120 +969,151 @@ def fetch_product_metadata(page_url: str) -> Dict[str, Any]:
 
 
 def live_search_offers(user_text: str, intent: Dict[str, Any], refresh_nonce: str = "", avoid_urls: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Discover real product pages first, then extract product data from verified pages."""
     client = gemini_model()
     if client is None or not LIVE_SEARCH_ENABLED:
         return []
+
     avoid_urls = [u for u in (avoid_urls or []) if safe_public_url(u)]
+    avoid_set = {normalize_external_url(u) for u in avoid_urls if normalize_external_url(u)}
     search_terms = semantic_search_terms(user_text, intent)
-    search_queries = build_live_search_queries(user_text, intent, refresh_nonce)
-    ai_phrases = [str(x) for x in intent.get("search_phrases", []) if str(x).strip()]
-    query_block = "\n".join(f"- {q}" for q in list(dict.fromkeys(ai_phrases + search_queries))[:10])
-    avoid_block = "\n".join(f"- {u}" for u in avoid_urls[:40]) or "- لا يوجد"
-    prompt = f"""
-أنت محرك بحث تسوق حقيقي للسوق الأردني. نفّذ بحث Google حي الآن باستخدام أداة Google Search.
-لا تجب من الذاكرة. تعامل مع الطلب كبحث شراء متعدد الاستعلامات، وليس سؤالًا عامًا.
+    raw_queries = build_live_search_queries(user_text, intent, refresh_nonce)
+    ai_phrases = [str(x).strip() for x in intent.get("search_phrases", []) if str(x).strip()]
 
-طلب المستخدم الأصلي: {user_text!r}
-المفاهيم الدلالية والمرادفات: {json.dumps(search_terms[:30], ensure_ascii=False)}
-عبارات البحث المقترحة:
-{query_block}
+    queries: List[str] = []
+    for q in ai_phrases + raw_queries:
+        q = str(q).strip()
+        if q and q not in queries:
+            queries.append(q)
+    if not queries:
+        queries = [user_text]
+    queries = queries[:6]
+
+    candidate_urls: List[str] = []
+    candidate_titles: Dict[str, str] = {}
+
+    def add_candidate_url(value: Any, title: str = "") -> None:
+        if not isinstance(value, str):
+            return
+        value = value.strip().strip("()[]{}<>.,;\"'")
+        if not value.startswith(("http://", "https://")):
+            return
+        normalized = normalize_external_url(value)
+        if not normalized or normalized in avoid_set or normalized in candidate_urls:
+            return
+        if safe_public_url(normalized):
+            candidate_urls.append(normalized)
+            if title:
+                candidate_titles[normalized] = title[:180]
+
+    for index, query in enumerate(queries):
+        prompt = f"""
+أنت وكيل بحث تسوق مباشر للسوق الأردني.
+استخدم Google Search الآن وابحث فعليًا عن صفحات منتجات قابلة للشراء، ولا تعتمد على الذاكرة.
+
+طلب المستخدم: {user_text!r}
+مرادفات ومفاهيم المنتج: {json.dumps(search_terms[:30], ensure_ascii=False)}
 النوايا المستخرجة: {json.dumps(_intent_public(intent), ensure_ascii=False)}
-رقم تنويع البحث: {refresh_nonce!r}
+استعلام البحث الحالي: {query!r}
+تنويع البحث: {refresh_nonce!r}
 
-ابحث عبر عدة استعلامات مختلفة. إذا كان الطلب كلمة واحدة، وسّعه دلاليًا قبل البحث.
-مثال: "بنطال" = بنطال/بنطلون/سروال/pants/trousers/jeans.
-مثال: "ستيّانة" = ستيانة/سوتيان/برا/حمالة صدر/صدرية/bra/bras.
-لا تتعامل مع الكلمة المحلية كأنها خطأ أو فئة مجهولة.
+ابحث عن منتجات حقيقية مطابقة للطلب.
+إذا كانت الكلمة عامية أو ناقصة فوسّعها دلاليًا، مثل:
+- بنطال/بنطلون/سروال/pants/trousers/jeans
+- ستيّانة/ستيانه/سوتيان/برا/حمالة صدر/صدرية/bra/bras
+الأولوية: متجر أردني أو صفحة تشحن إلى الأردن، ثم المتاجر العالمية.
+ابحث في أكثر من متجر ولا تكرر نفس المتجر إن وجدت بدائل.
 
-أعد JSON فقط:
-{{"offers":[{{"title":"اسم المنتج الحقيقي","merchant_name":"اسم المتجر الحقيقي","category":"makeup|clothes|gifts|watches|perfumes|shoes|lingerie|scarves","price_jod":رقم أو null,"description":"وصف قصير من الصفحة","city":"الأردن أو المدينة إن ظهرت","source_url":"الرابط الكامل لصفحة المنتج","image_url":"رابط الصورة إن ظهر","tags":[],"colors":[],"style":[],"sizes":[],"size_system":""}}]}}
-
-قواعد:
-1) يجب أن يكون source_url رابط صفحة منتج/عرض حقيقي، وليس صفحة بحث عامة أو الصفحة الرئيسية كلما أمكن.
-2) لا تخترع أي منتج أو متجر أو سعر.
-3) لا تستخدم نفس الرابط الموجود في قائمة الروابط السابقة.
-4) أعطِ الأولوية للمتاجر الأردنية والمتاجر التي تعرض السعر بالدينار الأردني أو تشحن للأردن.
-5) ابحث في متاجر متعددة، وليس متجرًا واحدًا.
-6) إذا لم تجد السعر في نتيجة البحث، لا تخمّنه؛ اتركه null ودع النظام يقرأ بيانات الصفحة.
-7) أعطِ نتائج متنوعة تغطي مرادفات الطلب.
-8) عند refresh ابحث عن منتجات/متاجر مختلفة، وليس مجرد إعادة ترتيب النتائج القديمة.
+في ردك اذكر روابط صفحات المنتجات الحقيقية فقط، كل رابط في سطر مستقل، مع اسم المنتج إن ظهر.
+لا تخترع أي رابط.
+لا تعطِ صفحة نتائج بحث أو الصفحة الرئيسية إذا كانت صفحة المنتج متاحة.
+لا تستخدم هذه الروابط السابقة:
+{json.dumps(list(avoid_set)[:30], ensure_ascii=False)}
 """
-    try:
-        config = genai_types.GenerateContentConfig(
-            response_mime_type="application/json",
-            tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-            temperature=0.2,
-        ) if genai_types else None
-        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
-        data = json.loads(getattr(response, "text", "{}") or "{}")
-        candidates = data.get("offers", []) if isinstance(data, dict) else []
-        grounding_sources = _extract_grounding_sources(response)
-        # If structured JSON is weak, use the actual grounded URLs as a second discovery layer.
-        if not isinstance(candidates, list):
-            candidates = []
-        existing_urls = {normalize_external_url(x.get("source_url")) for x in candidates if isinstance(x, dict)}
-        for source in grounding_sources:
-            if source["url"] not in existing_urls:
-                candidates.append({"source_url": source["url"], "title": source.get("title", "")})
-        out: List[Dict[str, Any]] = []
-        seen = set(avoid_urls)
-        for item in candidates:
-            if not isinstance(item, dict):
-                continue
-            url = normalize_external_url(item.get("source_url"))
-            if not url or url in seen:
-                continue
-            verified, final_url, verify_status = verify_external_url(url)
-            if not verified:
-                LOGGER.info("Skipping unverified live offer URL %s (%s)", url, verify_status)
-                continue
-            url = final_url or url
-            if url in seen:
-                continue
-            metadata = fetch_product_metadata(url)
-            price = safe_float(item.get("price_jod"))
-            if price is None:
-                price = safe_float(metadata.get("price_jod"))
-            if price is None or price <= 0:
-                continue
-            title = str(item.get("title") or "").strip()[:180]
-            if len(title) < 3:
-                title = str(metadata.get("title") or "").strip()[:180]
-            if len(title) < 3:
-                continue
-            description = str(item.get("description") or "").strip()
-            if not description:
-                description = str(metadata.get("description") or "").strip()
-            merchant = str(item.get("merchant_name") or "").strip()[:100]
-            if not merchant:
-                merchant = (urlparse(url).hostname or "متجر").replace("www.", "")[:100]
-            image = normalize_external_url(item.get("image_url")) or normalize_external_url(metadata.get("image_url")) or fetch_open_graph_image(url)
-            oid = _live_offer_id(url)
-            text_for_category = " ".join([title, description, " ".join(_as_list(item.get("tags"))), url])
-            category = str(item.get("category") or "").strip()
-            if category not in CATEGORY_LABELS:
-                detected = detect_categories(text_for_category)
-                category = detected[0] if detected else (intent.get("categories") or ["gifts"])[0]
-            tags = list(dict.fromkeys(_as_list(item.get("tags"))))
-            colors = _as_list(item.get("colors"))
-            style = _as_list(item.get("style"))
-            out.append({
-                "id": oid, "merchant_name": merchant, "title": title, "category": category,
-                "price_jod": round(price, 2), "tags": tags, "colors": colors, "style": style,
-                "city": str(item.get("city") or "الأردن")[:60],
-                "description": (description or "عرض حقيقي تم العثور عليه عبر البحث المباشر")[:360],
-                "image_url": image or fallback_image_url(oid), "whatsapp_url": "", "instagram_url": "",
-                "sizes": _as_list(item.get("sizes")), "size_system": str(item.get("size_system") or ""),
-                "store_url": url, "source": "google_search",
-            })
-            seen.add(url)
-            if len(out) >= LIVE_SEARCH_MAX:
-                break
-        return out
-    except Exception as exc:
-        LOGGER.warning("Live Google Search failed; using internal inventory: %s", exc)
-        return []
+        try:
+            config = genai_types.GenerateContentConfig(
+                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+                temperature=0.1,
+            ) if genai_types else None
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
+            text_response = getattr(response, "text", "") or ""
 
+            for source in _extract_grounding_sources(response):
+                add_candidate_url(source.get("url"), source.get("title", ""))
+
+            for url in re.findall(r"https?://\S+", text_response):
+                add_candidate_url(url)
+
+            for match in re.findall(r"\]\((https?://[^)\s]+)\)", text_response):
+                add_candidate_url(match)
+        except Exception as exc:
+            LOGGER.warning("Live search query %d failed: %s", index + 1, exc)
+
+        if len(candidate_urls) >= max(18, LIVE_SEARCH_MAX * 2):
+            break
+
+    out: List[Dict[str, Any]] = []
+    seen_urls = set(avoid_set)
+
+    for url in candidate_urls:
+        if url in seen_urls:
+            continue
+
+        verified, final_url, verify_status = verify_external_url(url)
+        if not verified:
+            LOGGER.info("Skipping unverified live offer URL %s (%s)", url, verify_status)
+            continue
+        url = normalize_external_url(final_url or url)
+        if not url or url in seen_urls:
+            continue
+
+        metadata = fetch_product_metadata(url)
+        title = str(metadata.get("title") or candidate_titles.get(url) or "").strip()[:180]
+        description = str(metadata.get("description") or "").strip()[:360]
+        image = normalize_external_url(metadata.get("image_url")) or fetch_open_graph_image(url)
+
+        price = safe_float(metadata.get("price_jod"))
+        if price is None or price <= 0:
+            continue
+        if len(title) < 3:
+            continue
+
+        merchant = (urlparse(url).hostname or "متجر").replace("www.", "")[:100]
+        text_for_category = " ".join([title, description, url, " ".join(search_terms)])
+        detected_categories = detect_categories(text_for_category)
+        category = detected_categories[0] if detected_categories else (intent.get("categories") or ["gifts"])[0]
+
+        combined = normalize_text(f"{title} {description}")
+        colors = [c for c in COLOR_SYNONYMS if normalize_text(c) in combined][:6]
+        tags = list(dict.fromkeys(search_terms[:10]))
+        style = [s for s in intent.get("styles", []) if s in {"luxury","party","modest","classic","minimal","gift"}]
+
+        oid = _live_offer_id(url)
+        out.append({
+            "id": oid,
+            "merchant_name": merchant,
+            "title": title,
+            "category": category,
+            "price_jod": round(price, 2),
+            "tags": tags,
+            "colors": colors,
+            "style": style,
+            "city": "الأردن",
+            "description": description or "منتج حقيقي تم العثور عليه عبر البحث المباشر",
+            "image_url": image or fallback_image_url(oid),
+            "whatsapp_url": "",
+            "instagram_url": "",
+            "sizes": [],
+            "size_system": "",
+            "store_url": url,
+            "source": "google_search",
+        })
+        seen_urls.add(url)
+
+        if len(out) >= LIVE_SEARCH_MAX:
+            break
+
+    return out
 
 def gemini_model() -> Any:
     global _GEMINI_CLIENT
@@ -2550,14 +2581,9 @@ def recommend(intent: Dict[str, Any], raw_query: str = "", refresh_nonce: str = 
         # Let Gemini judge semantic relevance after the web pages have been verified.
         if raw_query and live_results:
             live_results = ai_rerank(raw_query, live_results)
-        # Real web results are the primary result set. The internal demo inventory is used
-        # only when the live search returns too few results, so it cannot drown out real matches.
-        if len(live_results) >= 4:
-            results = live_results
-        else:
-            static_results = [x for x in results if x["id"] not in set(live_ids)]
-            static_results.sort(key=lambda x: (-x["score"], x["price_jod"], x["id"]))
-            results = live_results + static_results[:max(0, 6 - len(live_results))]
+        # Keep live results live. Do not mix unrelated demo inventory into a real
+        # shopping query merely to fill the grid.
+        results = live_results
     else:
         if intent.get("priority") == "cheapest":
             results.sort(key=lambda item: (item["price_jod"], -item["score"], item["id"]))
@@ -2747,7 +2773,7 @@ HTML_TEMPLATE = r"""
   </div>
   <div id="authModal" class="hidden fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"><div class="w-full max-w-md rounded-[2rem] bg-white p-6"><div class="flex items-center justify-between"><h3 class="text-2xl font-black">حسابك</h3><button onclick="closeAuth()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black">×</button></div><div class="mt-4 flex gap-2"><button id="loginTab" onclick="switchAuth('login')" class="flex-1 rounded-xl bg-neutral-950 text-white py-3 font-black">دخول</button><button id="registerTab" onclick="switchAuth('register')" class="flex-1 rounded-xl bg-neutral-100 py-3 font-black">حساب جديد</button></div><div id="authForm" class="mt-4 space-y-3"></div><div id="authMsg" class="text-sm mt-3"></div></div></div>
   <div id="cartModal" class="hidden fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"><div class="w-full max-w-lg rounded-[2rem] bg-white p-6"><div class="flex items-center justify-between"><h3 class="text-2xl font-black">سلة الطلبات</h3><button onclick="closeCart()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black">×</button></div><div id="cartItems" class="mt-4 space-y-2"></div><div class="mt-4 rounded-2xl bg-neutral-50 p-4 flex items-center justify-between"><span class="font-black">الإجمالي</span><span id="cartTotal" class="font-black text-lg"></span></div><button onclick="startCheckoutFlow()" class="mt-4 w-full min-h-[52px] rounded-2xl bg-neutral-950 text-white font-black">الدفع للطلبات في السلة</button></div></div>
-  <div id="checkoutModal" class="hidden fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"><div class="w-full max-w-lg rounded-[2rem] bg-white p-6"><div class="flex items-center justify-between"><h3 class="text-2xl font-black">إتمام الدفع</h3><button onclick="closeCheckout()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black">×</button></div><div id="checkoutSummary" class="mt-4 rounded-2xl bg-neutral-50 p-4 text-sm leading-6"></div><label class="block mt-4"><span class="text-xs font-black text-neutral-500">اسم المحوّل</span><input id="payerName" maxlength="120" class="mt-2 w-full rounded-2xl bg-neutral-100 px-4 py-3 outline-none focus:ring-2 focus:ring-neutral-900 font-bold" placeholder="مثال: هلا نايف المشاقبة"></label><button id="submitCheckoutBtn" onclick="submitCheckout()" class="mt-4 w-full min-h-[52px] rounded-2xl bg-neutral-950 text-white font-black">أرسلت التحويل — أرسل الطلب</button><div id="checkoutStatus" class="mt-3 rounded-2xl bg-neutral-50 p-4 text-sm"></div></div></div>
+  <div id="checkoutModal" class="hidden fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"><div class="w-full max-w-lg rounded-[2rem] bg-white p-6"><div class="flex items-center justify-between"><h3 class="text-2xl font-black">إتمام الدفع</h3><button onclick="closeCheckout()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black">×</button></div><div id="checkoutSummary" class="mt-4 rounded-2xl bg-neutral-50 p-4 text-sm leading-6"></div><label class="block mt-4"><span class="text-xs font-black text-neutral-500">اسم المحوّل</span><input id="payerName" maxlength="120" class="mt-2 w-full rounded-2xl bg-neutral-100 px-4 py-3 outline-none focus:ring-2 focus:ring-neutral-900 font-bold" placeholder="مثال: الاسم كما يظهر في إشعار التحويل"></label><button id="submitCheckoutBtn" onclick="submitCheckout()" class="mt-4 w-full min-h-[52px] rounded-2xl bg-neutral-950 text-white font-black">أرسلت التحويل — أرسل الطلب</button><div id="checkoutStatus" class="mt-3 rounded-2xl bg-neutral-50 p-4 text-sm"></div></div></div>
   <div id="accountModal" class="hidden fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"><div class="w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-[2rem] bg-white p-6"><div class="flex items-center justify-between"><div><div class="text-xs text-neutral-400 font-black">حسابي</div><h3 id="accountName" class="text-2xl font-black"></h3></div><button onclick="closeAccount()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black">×</button></div><button onclick="loadOrders()" class="mt-4 rounded-xl bg-neutral-100 px-4 py-2 font-black">تحديث الطلبات</button><div id="ordersBox" class="mt-4 space-y-3"></div><button onclick="logoutUser()" class="mt-4 rounded-xl bg-red-50 text-red-700 px-4 py-2 font-black">تسجيل الخروج</button></div></div>
   <div id="suggestModal" class="hidden fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"><div class="w-full max-w-md rounded-[2rem] bg-white p-6"><div class="flex items-center justify-between"><h3 class="text-2xl font-black">صندوق الاقتراحات</h3><button onclick="closeSuggestion()" class="w-10 h-10 rounded-xl bg-neutral-100 font-black">×</button></div><textarea id="suggestionText" rows="5" maxlength="1000" class="mt-4 w-full rounded-2xl bg-neutral-100 px-4 py-3 outline-none focus:ring-2 focus:ring-neutral-900 font-bold" placeholder="ما الذي تريدين تحسينه أو إضافته؟"></textarea><button onclick="sendSuggestion()" class="mt-4 w-full min-h-[50px] rounded-2xl bg-neutral-950 text-white font-black">إرسال الاقتراح</button><div id="suggestMsg" class="mt-3 text-sm"></div></div></div>
   <script>
@@ -3091,7 +3117,7 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 return respond({
                     "ok": True,
                     "service": "التوصية",
-                    "version": "7.0",
+                    "version": "9.0",
                     "port": PORT,
                     "inventory_count": len(SEED_OFFERS),
                     "live_search_enabled": LIVE_SEARCH_ENABLED,
