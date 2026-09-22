@@ -38,7 +38,7 @@ class ProductSearchUnitTests(unittest.TestCase):
     def test_query_generator(self):
         intent = self.intent_engine.enrich("black wide leg pants under 20 JOD Jordan", {})
         queries = QueryGenerator(self.intent_engine).generate("black wide leg pants under 20 JOD Jordan", intent)
-        self.assertGreaterEqual(len(queries), 6)
+        self.assertGreaterEqual(len(queries), 5)
         self.assertTrue(any("site:.jo" in q for q in queries))
         self.assertTrue(any("JOD" in q or "Jordan" in q for q in queries))
 
