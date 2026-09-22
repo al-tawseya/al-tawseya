@@ -3001,7 +3001,7 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                     "inventory_count": len(SEED_OFFERS),
                     "live_search_enabled": LIVE_SEARCH_ENABLED,
                     "gemini_enabled": bool(gemini_model()),
-                    "search_engine_version": "10.0",
+                    "search_engine_version": "14.0",
                     "search_pipeline": ["intent", "queries", "web_discovery", "product_page", "verification", "price_conversion", "dedupe", "price_compare", "hard_filter", "ranking"],
                     "timestamp": int(time.time()),
                 })
