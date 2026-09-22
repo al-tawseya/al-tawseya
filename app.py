@@ -685,6 +685,38 @@ def normalize_external_url(url: Any) -> str:
     return value if safe_public_url(value) else ""
 
 
+def verify_external_url(url: Any, timeout: int = 8) -> Tuple[bool, str, str]:
+    """Verify a public HTTP(S) URL and return (ok, final_url, status)."""
+    candidate = normalize_external_url(url)
+    if not candidate:
+        return False, "", "invalid_url"
+    try:
+        req = urllib.request.Request(
+            candidate,
+            headers={"User-Agent": "Mozilla/5.0 AlTawseyaBot/7.0"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            final_url = normalize_external_url(resp.geturl())
+            code = int(getattr(resp, "status", 200) or 200)
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if not final_url:
+                return False, "", "unsafe_redirect"
+            if code >= 400:
+                return False, final_url, f"http_{code}"
+            if content_type and not any(x in content_type for x in ("text/html", "application/xhtml+xml")):
+                return False, final_url, "not_html"
+            return True, final_url, "verified"
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403, 429}:
+            final_url = normalize_external_url(getattr(exc, "url", "") or candidate)
+            return bool(final_url), final_url, f"http_{exc.code}"
+        return False, normalize_external_url(getattr(exc, "url", "") or candidate), f"http_{exc.code}"
+    except Exception as exc:
+        LOGGER.debug("URL verification failed for %s: %s", candidate, exc)
+        return False, "", "unreachable"
+
+
 def fetch_open_graph_image(page_url: str) -> str:
     page_url = normalize_external_url(page_url)
     if not page_url:
@@ -794,6 +826,13 @@ def live_search_offers(user_text: str, intent: Dict[str, Any], refresh_nonce: st
                 continue
             url = normalize_external_url(item.get("source_url"))
             if not url or url in seen:
+                continue
+            verified, final_url, verify_status = verify_external_url(url)
+            if not verified:
+                LOGGER.info("Skipping unverified live offer URL %s (%s)", url, verify_status)
+                continue
+            url = final_url or url
+            if url in seen:
                 continue
             price = safe_float(item.get("price_jod"))
             if price is None or price <= 0:
@@ -1087,6 +1126,9 @@ size_system TEXT NOT NULL DEFAULT '',
 source_url TEXT NOT NULL DEFAULT '',
 source TEXT NOT NULL DEFAULT 'seed',
 last_checked TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+verification_status TEXT NOT NULL DEFAULT 'unverified',
+verified_url TEXT NOT NULL DEFAULT '',
+verified_at TEXT,
 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -1259,6 +1301,9 @@ def init_db() -> None:
                 "source_url": "TEXT NOT NULL DEFAULT ''",
                 "source": "TEXT NOT NULL DEFAULT 'seed'",
                 "last_checked": "TEXT NOT NULL DEFAULT ''",
+                "verification_status": "TEXT NOT NULL DEFAULT 'unverified'",
+                "verified_url": "TEXT NOT NULL DEFAULT ''",
+                "verified_at": "TEXT",
             })
             _ensure_columns(conn, "sessions", {
                 "user_id": "INTEGER",
@@ -1460,9 +1505,9 @@ def upsert_live_offers(items: Sequence[Dict[str, Any]]) -> List[int]:
                     item.get("store_url", ""), "google_search",
                 )
                 if existing:
-                    conn.execute('''UPDATE merchant_offers SET merchant_name=?,title=?,category=?,price_jod=?,tags=?,colors=?,style=?,city=?,description=?,image_url=?,whatsapp_url=?,instagram_url=?,store_url=?,sizes=?,size_system=?,source_url=?,source=?,last_checked=CURRENT_TIMESTAMP WHERE id=?''', values + (oid,))
+                    conn.execute('''UPDATE merchant_offers SET merchant_name=?,title=?,category=?,price_jod=?,tags=?,colors=?,style=?,city=?,description=?,image_url=?,whatsapp_url=?,instagram_url=?,store_url=?,sizes=?,size_system=?,source_url=?,source=?,last_checked=CURRENT_TIMESTAMP,verification_status='verified',verified_url=?,verified_at=CURRENT_TIMESTAMP WHERE id=?''', values + (item.get("store_url", ""), oid))
                 else:
-                    conn.execute('''INSERT INTO merchant_offers (id,merchant_name,title,category,price_jod,tags,colors,style,city,description,image_url,whatsapp_url,instagram_url,store_url,sizes,size_system,source_url,source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (oid,) + values)
+                    conn.execute('''INSERT INTO merchant_offers (id,merchant_name,title,category,price_jod,tags,colors,style,city,description,image_url,whatsapp_url,instagram_url,store_url,sizes,size_system,source_url,source,verification_status,verified_url,verified_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (oid,) + values + ("verified", item.get("store_url", ""), time.strftime("%Y-%m-%d %H:%M:%S")))
             conn.commit()
         finally:
             conn.close()
@@ -1599,6 +1644,11 @@ def update_offer_links(offer_id: int, store_url: str, whatsapp_url: str, instagr
         return value
 
     store_url = clean_url(store_url, "رابط المتجر")
+    if store_url:
+        verified, final_url, verify_status = verify_external_url(store_url)
+        if not verified:
+            raise ValueError(f"رابط المتجر لا يمكن التحقق منه الآن ({verify_status}). استخدمي رابط صفحة المنتج/المتجر الحقيقي.")
+        store_url = final_url or store_url
     whatsapp_url = clean_url(whatsapp_url, "رابط واتساب")
     instagram_url = clean_url(instagram_url, "رابط إنستغرام")
     image_url = clean_url(image_url, "رابط الصورة")
@@ -1688,7 +1738,7 @@ def list_admin_offers() -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
         rows = conn.execute(
-            """SELECT id, merchant_name, title, price_jod, store_url, whatsapp_url, instagram_url, image_url
+            """SELECT id, merchant_name, title, price_jod, store_url, whatsapp_url, instagram_url, image_url, verification_status, verified_url, verified_at
                FROM merchant_offers ORDER BY id ASC"""
         ).fetchall()
         return [dict(row) for row in rows]
@@ -2578,7 +2628,13 @@ function renderOrders(orders){const box=document.getElementById('ordersBox');doc
 async function loadOrders(){try{const d=await apiPublic('/api/orders',{token:authToken});let becamePaid=false;for(const o of d.orders){if(knownOrderStatuses[o.batch_id]&&knownOrderStatuses[o.batch_id]!=="paid"&&o.status==="paid")becamePaid=true;knownOrderStatuses[o.batch_id]=o.status;}renderOrders(d.orders);if(becamePaid){document.getElementById('accountModal').classList.remove('hidden');showToast('✅ تم التحقق من الدفع. طلباتك أصبحت جاهزة للفتح.');}}catch(e){if(e.message)console.warn(e.message);}}
 function startOrderPolling(){stopOrderPolling();let attempts=0;orderPoll=setInterval(async()=>{attempts++;await loadOrders();if(attempts>60)stopOrderPolling();},5000);}
 function stopOrderPolling(){if(orderPoll){clearInterval(orderPoll);orderPoll=null;}}
-async function openPaid(dealId,channel){try{const d=await apiPublic('/api/deal/open',{token:authToken,deal_id:dealId,session_id:'',channel});window.open(d.url,'_blank','noopener');}catch(e){alert(e.message);}}
+async function openPaid(dealId,channel){
+const popup=window.open('about:blank','_blank','noopener,noreferrer');
+try{
+ const d=await apiPublic('/api/deal/open',{token:authToken,deal_id:dealId,session_id:'',channel});
+ if(popup){popup.location.href=d.url;}else{window.location.href=d.url;}
+}catch(e){if(popup)popup.close();alert(e.message);}
+}
 function logoutUser(){authToken='';currentUser=null;localStorage.removeItem('tawseya_auth');updateAccountBtn();closeAccount();loadCartSafe();}
 async function startCheckoutFlow(){if(!authToken){closeCart();openAuth('login');return;}try{const d=await apiPublic('/api/checkout/start',{token:authToken});activeBatchId=d.batch.batch_id;document.getElementById('checkoutSummary').innerHTML=`سيتم إرسال <b>${d.batch.item_count}</b> طلبات بقيمة <b>${d.batch.total_jod} د.أ</b> إجمالًا. بعد التحويل اكتبي الاسم الذي ظهر في إشعار البنك.`;document.getElementById('checkoutStatus').textContent='';document.getElementById('checkoutModal').classList.remove('hidden');closeCart();}catch(e){alert(e.message);}}
 function closeCheckout(){document.getElementById('checkoutModal').classList.add('hidden');}
@@ -2801,7 +2857,7 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 return respond({
                     "ok": True,
                     "service": "التوصية",
-                    "version": "6.0",
+                    "version": "7.0",
                     "port": PORT,
                     "inventory_count": len(SEED_OFFERS),
                     "live_search_enabled": LIVE_SEARCH_ENABLED,
@@ -3012,10 +3068,20 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 if offer is None:
                     return respond({"error": "الإعلان غير موجود."}, 404)
                 url = offer.store_url if channel == "store" else (offer.whatsapp_url if channel == "whatsapp" else offer.instagram_url)
-                parsed = urlparse(url)
-                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                    return respond({"error": "رابط المتجر لهذا الإعلان غير مُضاف أو غير صالح. حدّثيه من لوحة الإدارة."}, 400)
-                return respond({"ok": True, "url": url})
+                verified, final_url, verify_status = verify_external_url(url)
+                if not verified:
+                    return respond({"error": "تعذر فتح رابط المنتج حاليًا. هذا العرض أصبح غير متاح، وسنبحث لك عن بديل."}, 409)
+                with DB_LOCK:
+                    conn = get_connection()
+                    try:
+                        conn.execute(
+                            "UPDATE merchant_offers SET verification_status='verified', verified_url=?, verified_at=CURRENT_TIMESTAMP, last_checked=CURRENT_TIMESTAMP WHERE id=?",
+                            (final_url or url, int(offer.id)),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                return respond({"ok": True, "url": final_url or url})
 
             if path == "/api/recommend":
                 query = str(data.get("query", "")).strip()
