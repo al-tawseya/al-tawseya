@@ -35,6 +35,21 @@ class ProductSearchUnitTests(unittest.TestCase):
         self.assertIn("بنطال", intent["synonyms"])
         self.assertIn("pants", intent["synonyms"])
 
+    def test_kandarah_sudah_intent_and_relevance(self):
+        intent = self.intent_engine.enrich("كندرة سودة", {})
+        self.assertIn("shoes", intent["categories"])
+        self.assertIn("black", intent["colors"])
+        product = {
+            "title": "Black Flat Shoes",
+            "description": "Women flat shoes",
+            "category": "shoes",
+            "grounding_title": "Black Flat Shoes",
+            "search_query": "كندرة سودة الأردن",
+        }
+        verifier = __import__("product_search").ProductVerifier()
+        ok, reason = verifier.verify_match(product, "كندرة سودة", intent)
+        self.assertTrue(ok, reason)
+
     def test_query_generator(self):
         intent = self.intent_engine.enrich("black wide leg pants under 20 JOD Jordan", {})
         queries = QueryGenerator(self.intent_engine).generate("black wide leg pants under 20 JOD Jordan", intent)
