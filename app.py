@@ -1063,7 +1063,7 @@ def live_search_offers(user_text: str, intent: Dict[str, Any], refresh_nonce: st
             if category not in CATEGORY_LABELS:
                 detected = detect_categories(text_for_category)
                 category = detected[0] if detected else (intent.get("categories") or ["gifts"])[0]
-            tags = list(dict.fromkeys(_as_list(item.get("tags")) + search_terms[:12]))
+            tags = list(dict.fromkeys(_as_list(item.get("tags"))))
             colors = _as_list(item.get("colors"))
             style = _as_list(item.get("style"))
             out.append({
@@ -2534,21 +2534,30 @@ def recommend(intent: Dict[str, Any], raw_query: str = "", refresh_nonce: str = 
     live = live_search_offers(raw_query, intent, refresh_nonce, avoid_urls=offer_urls_for_ids(list(avoid_set))) if raw_query else []
     if live:
         live_ids = upsert_live_offers(live)
+        live_results: List[Dict[str, Any]] = []
         for item, oid in zip(live, live_ids):
             live_offer = Offer(id=oid, merchant_name=item["merchant_name"], title=item["title"], category=item["category"], price_jod=item["price_jod"], tags=item.get("tags", []), colors=item.get("colors", []), style=item.get("style", []), city=item.get("city", "الأردن"), description=item.get("description", ""), image_url=item.get("image_url", fallback_image_url(oid)), whatsapp_url="", instagram_url="", sizes=item.get("sizes", []), size_system=item.get("size_system", ""), store_url=item.get("store_url", ""))
             score, reasons = score_offer(live_offer, intent)
-            if score < 0: score, reasons = 55.0, ["نتيجة من بحث مباشر على الويب"]
+            if score < 0:
+                score, reasons = 50.0, ["نتيجة حقيقية من بحث مباشر؛ الملاءمة تحتاج تحققًا إضافيًا"]
             payload = dict(item)
             payload.pop("store_url", None); payload.pop("whatsapp_url", None); payload.pop("instagram_url", None)
             payload["category_label"] = CATEGORY_LABELS.get(item["category"], item["category"])
-            payload["score"] = max(score, 55.0); payload["reasons"] = list(dict.fromkeys(["نتيجة حديثة من بحث مباشر على الويب"] + reasons))[:4]
+            payload["score"] = max(score, 50.0)
+            payload["reasons"] = list(dict.fromkeys(["نتيجة حقيقية من البحث المباشر"] + reasons))[:4]
             payload["match_type"] = "بحث مباشر"; payload["image_url"] = item.get("image_url") or fallback_image_url(oid)
-            results.append(payload)
-        live_ids_set = set(live_ids)
-        live_results = [x for x in results if x["id"] in live_ids_set]
-        static_results = [x for x in results if x["id"] not in live_ids_set]
-        static_results.sort(key=lambda x: (-x["score"], x["price_jod"], x["id"]))
-        results = live_results + static_results[:max(4, LIVE_SEARCH_MAX // 2)]
+            live_results.append(payload)
+        # Let Gemini judge semantic relevance after the web pages have been verified.
+        if raw_query and live_results:
+            live_results = ai_rerank(raw_query, live_results)
+        # Real web results are the primary result set. The internal demo inventory is used
+        # only when the live search returns too few results, so it cannot drown out real matches.
+        if len(live_results) >= 4:
+            results = live_results
+        else:
+            static_results = [x for x in results if x["id"] not in set(live_ids)]
+            static_results.sort(key=lambda x: (-x["score"], x["price_jod"], x["id"]))
+            results = live_results + static_results[:max(0, 6 - len(live_results))]
     else:
         if intent.get("priority") == "cheapest":
             results.sort(key=lambda item: (item["price_jod"], -item["score"], item["id"]))
@@ -3004,6 +3013,8 @@ def _intent_public(intent: Dict[str, Any]) -> Dict[str, Any]:
         "styles": intent.get("styles", []),
         "sizes": intent.get("sizes", {}),
         "product_terms": intent.get("product_terms", []),
+        "synonyms": intent.get("synonyms", [])[:20],
+        "search_phrases": intent.get("search_phrases", [])[:10],
     }
 
 
