@@ -1170,6 +1170,97 @@ class SearchCache:
             self.data[key] = (time.time(), [dict(x) for x in products], dict(debug))
 
 
+class URLContextProductEnricher:
+    """Use Gemini URL Context as a fallback for JS-heavy storefronts that plain urllib cannot read."""
+    def __init__(self, deps: SearchDependencies):
+        self.deps = deps
+
+    def enrich(self, user_text: str, intent: Dict[str, Any], candidates: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        client = self.deps.get_gemini_client()
+        if client is None or not hasattr(client, "interactions"):
+            return {}
+
+        urls = []
+        for candidate in candidates:
+            url = canonicalize_url(candidate.get("source_url"))
+            if url and url not in urls:
+                urls.append(url)
+            if len(urls) >= 16:
+                break
+        if not urls:
+            return {}
+
+        payload_shape = {
+            "type": "object",
+            "properties": {
+                "products": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "title": {"type": ["string", "null"]},
+                            "description": {"type": ["string", "null"]},
+                            "price_original": {"type": ["number", "null"]},
+                            "currency_original": {"type": ["string", "null"]},
+                            "image_url": {"type": ["string", "null"]},
+                            "merchant_name": {"type": ["string", "null"]},
+                            "brand": {"type": ["string", "null"]},
+                            "sku": {"type": ["string", "null"]},
+                            "availability": {"type": ["string", "null"]},
+                            "sizes": {"type": "array", "items": {"type": "string"}},
+                            "colors": {"type": "array", "items": {"type": "string"}},
+                            "category": {"type": ["string", "null"]},
+                            "material": {"type": ["string", "null"]},
+                        },
+                        "required": ["url", "title", "description", "price_original", "currency_original"],
+                    },
+                }
+            },
+            "required": ["products"],
+        }
+
+        prompt = f"""
+افحص صفحات المنتجات العامة الموجودة في الروابط التالية باستخدام URL Context.
+طلب المستخدم: {user_text!r}
+النية: {json.dumps(intent, ensure_ascii=False)}
+
+لا تخترع أي معلومة.
+لكل رابط:
+- استخرج اسم المنتج إذا ظهر.
+- استخرج السعر الحالي إذا ظهر.
+- استخرج العملة.
+- استخرج المتجر والوصف والصورة والمقاس/اللون/البراند/SKU عندما تكون موجودة.
+- إذا لم تجد السعر فعليًا، اجعل price_original = null.
+- لا تنقل معلومات من رابط إلى رابط آخر.
+- تجاهل أي صفحة ليست منتجًا واضحًا.
+"""
+        try:
+            interaction = client.interactions.create(
+                model=self.deps.model_name,
+                input=prompt + "\n\nURLs:\n" + "\n".join(urls),
+                tools=[{"type": "url_context"}],
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": payload_shape,
+                },
+            )
+            raw = str(getattr(interaction, "output_text", "") or "")
+            data = json.loads(raw)
+            out: Dict[str, Dict[str, Any]] = {}
+            for item in (data.get("products", []) if isinstance(data, dict) else []):
+                if not isinstance(item, dict):
+                    continue
+                url = canonicalize_url(item.get("url"))
+                if url in urls:
+                    out[url] = item
+            return out
+        except Exception as exc:
+            LOGGER.warning("URL Context product enrichment failed: %s", exc)
+            return {}
+
+
 class ProductSearchEngine:
     def __init__(self, deps: SearchDependencies):
         self.deps = deps
@@ -1178,6 +1269,7 @@ class ProductSearchEngine:
         self.web_search = WebSearchEngine(deps)
         self.fetcher = ProductPageFetcher()
         self.extractor = ProductExtractor()
+        self.url_context = URLContextProductEnricher(deps)
         self.converter = CurrencyConverter()
         self.verifier = ProductVerifier()
         self.matcher = ProductMatcher()
@@ -1200,25 +1292,80 @@ class ProductSearchEngine:
         candidates, discovery_debug = self.web_search.discover(user_text, enriched, queries, avoid_urls or [])
 
         products: List[Dict[str, Any]] = []
+        rejected_candidates: List[Dict[str, Any]] = []
         rejection_reasons: Dict[str, int] = {}
         partial_count = 0
         verified_product_count = 0
 
+        # First pass: normal HTTP fetch + deterministic extraction.
         for candidate in candidates:
             page = self.fetcher.fetch(candidate["source_url"])
             if page.get("verification_status") != "verified_page":
+                rejected_candidates.append(candidate)
                 reason = page.get("rejection_reason", "broken_url")
                 rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
                 continue
 
             product = self.extractor.extract(page, candidate, enriched)
             if product.get("verification_status") != "verified":
+                rejected_candidates.append(candidate)
                 reason = product.get("rejection_reason", "not_product_page")
                 if reason == "no_price":
                     partial_count += 1
                 rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
                 continue
 
+            product["search_rank"] = candidate.get("search_rank", 999999)
+            product["source_url"] = candidate.get("source_url")
+            product["grounding_title"] = candidate.get("grounding_title", "")
+            product["search_query"] = candidate.get("search_query", "")
+            products.append(product)
+
+        # Second pass: URL Context for pages that are public but difficult to parse
+        # with plain urllib (client-rendered storefronts, protected HTML shells, etc.).
+        context_candidates = rejected_candidates[:16]
+        context_data = self.url_context.enrich(user_text, enriched, context_candidates) if context_candidates else {}
+        for candidate in context_candidates:
+            url = canonicalize_url(candidate.get("source_url"))
+            item = context_data.get(url)
+            if not item:
+                continue
+            try:
+                price = safe_float(item.get("price_original"))
+                currency = str(item.get("currency_original") or "").upper()
+                if price is None or price <= 0 or not currency:
+                    rejection_reasons["no_price"] = rejection_reasons.get("no_price", 0) + 1
+                    continue
+                product = {
+                    "verification_status": "verified",
+                    "title": str(item.get("title") or "").strip(),
+                    "description": str(item.get("description") or "").strip(),
+                    "image_url": str(item.get("image_url") or ""),
+                    "canonical_url": url,
+                    "merchant_name": str(item.get("merchant_name") or domain_of(url)),
+                    "brand": str(item.get("brand") or ""),
+                    "sku": str(item.get("sku") or ""),
+                    "availability": str(item.get("availability") or ""),
+                    "sizes": item.get("sizes") if isinstance(item.get("sizes"), list) else [],
+                    "colors": item.get("colors") if isinstance(item.get("colors"), list) else [],
+                    "category": str(item.get("category") or ""),
+                    "material": str(item.get("material") or ""),
+                    "price_original": price,
+                    "currency_original": currency,
+                    "search_rank": candidate.get("search_rank", 999999),
+                    "source_url": url,
+                    "grounding_title": candidate.get("grounding_title", ""),
+                    "search_query": candidate.get("search_query", ""),
+                }
+                if len(product["title"]) < 3:
+                    rejection_reasons["not_product_page"] = rejection_reasons.get("not_product_page", 0) + 1
+                    continue
+                products.append(product)
+            except Exception:
+                rejection_reasons["url_context_parse"] = rejection_reasons.get("url_context_parse", 0) + 1
+
+        normalized_products: List[Dict[str, Any]] = []
+        for product in products:
             fx = self.converter.to_jod(float(product["price_original"]), product.get("currency_original", ""))
             if fx.get("price_jod") is None:
                 rejection_reasons["no_reliable_jod_conversion"] = rejection_reasons.get("no_reliable_jod_conversion", 0) + 1
@@ -1229,10 +1376,6 @@ class ProductSearchEngine:
             product["conversion_source"] = fx.get("source")
             product["conversion_timestamp"] = fx.get("timestamp")
             product["verified_at"] = time.time()
-            product["search_rank"] = candidate.get("search_rank", 999999)
-            product["source_url"] = candidate.get("source_url")
-            product["grounding_title"] = candidate.get("grounding_title", "")
-            product["search_query"] = candidate.get("search_query", "")
             product["verification_status"] = "verified"
 
             ok, reason = self.verifier.verify_match(product, user_text, enriched)
@@ -1249,15 +1392,15 @@ class ProductSearchEngine:
                 continue
             product["tags"] = list(dict.fromkeys(enriched.get("product_terms", [])[:12]))
             product["source"] = "google_search"
-            products.append(product)
+            normalized_products.append(product)
 
         # Exact URL and cross-store duplicate products are merged before ranking.
-        pre_compare_count = len(products)
-        products = self.comparator.compare(products)
-        duplicate_count = max(0, pre_compare_count - len(products))
-        products = self.matcher_filter(products, enriched, rejection_reasons)
+        pre_compare_count = len(normalized_products)
+        normalized_products = self.comparator.compare(normalized_products)
+        duplicate_count = max(0, pre_compare_count - len(normalized_products))
+        normalized_products = self.matcher_filter(normalized_products, enriched, rejection_reasons)
 
-        ranked = self.ranker.rank(products, user_text, enriched, self.deps.max_results)
+        ranked = self.ranker.rank(normalized_products, user_text, enriched, self.deps.max_results)
         for item in ranked:
             item["id"] = self._stable_id(item.get("store_url"))
             item["image_url"] = item.get("image_url") or ""
@@ -1271,7 +1414,6 @@ class ProductSearchEngine:
             item.pop("canonical_url", None)
             item.pop("grounding_title", None)
             item.pop("search_query", None)
-            # Payload must not expose internal debug-only fields.
             item.pop("search_rank", None)
 
         debug = {
