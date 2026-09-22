@@ -42,6 +42,7 @@ SEARCH_SYNONYMS = {
     "سوتيان": ["ستيانه", "ستيّانة", "ستيانة", "سوتيان", "برا", "حمالة صدر", "صدرية", "bra", "bras", "wireless bra"],
     "برا": ["ستيانه", "ستيّانة", "سوتيان", "حمالة صدر", "صدرية", "bra", "bras", "brassiere"],
     "شوز": ["شوز", "حذاء", "كندرة", "shoe", "shoes", "sneakers", "heels", "boots", "flats"],
+    "كندرة": ["كندرة", "شوز", "حذاء", "shoe", "shoes", "sneakers", "flats"],
     "حذاء": ["شوز", "حذاء", "كندرة", "shoe", "shoes", "sneakers", "heels", "boots", "flats"],
     "فستان": ["فستان", "فساتين", "dress", "dresses", "evening dress", "maxi dress"],
     "عطر": ["عطر", "عطور", "برفان", "perfume", "fragrance", "parfum", "eau de parfum"],
@@ -53,7 +54,7 @@ SEARCH_SYNONYMS = {
 
 
 COLOR_SYNONYMS = {
-    "black": ["اسود", "أسود", "black", "noir"],
+    "black": ["اسود", "أسود", "سودة", "سوده", "black", "noir"],
     "white": ["ابيض", "أبيض", "white"],
     "red": ["احمر", "أحمر", "red"],
     "blue": ["ازرق", "أزرق", "blue", "navy"],
@@ -310,17 +311,40 @@ class WebSearchEngine:
         if client is None:
             return [], {"status": "gemini_unavailable"}
 
-        avoid = {canonicalize_url(u) for u in avoid_urls if canonicalize_url(u)}
         query_list = list(dict.fromkeys(str(q).strip() for q in queries if str(q).strip()))[:8]
         if not query_list:
             query_list = [user_text.strip()]
 
-        # One Interactions call can execute multiple Google searches and return direct
-        # URL annotations. This replaces the previous N sequential generateContent calls.
+        avoid = {canonicalize_url(u) for u in avoid_urls if canonicalize_url(u)}
+        candidates: List[Dict[str, Any]] = []
+        seen: set = set()
+        errors: List[str] = []
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "products": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "title": {"type": ["string", "null"]},
+                            "merchant": {"type": ["string", "null"]},
+                            "price": {"type": ["number", "null"]},
+                            "currency": {"type": ["string", "null"]},
+                        },
+                        "required": ["url", "title", "merchant", "price", "currency"],
+                    },
+                }
+            },
+            "required": ["products"],
+        }
+
         prompt = f"""
-أنت وكيل اكتشاف منتجات حقيقي داخل محرك بحث تسوق للأردن.
-نفّذ بحث Google حيًا باستخدام كل الاستعلامات الموجودة أدناه، وابحث عن صفحات منتجات قابلة للشراء.
-لا تعتمد على الذاكرة ولا تخترع أي رابط أو متجر أو منتج.
+أنت محرك اكتشاف منتجات حقيقي للأردن.
+نفّذ Google Search حيًا باستخدام مجموعة الاستعلامات التالية:
+{json.dumps(query_list, ensure_ascii=False)}
 
 طلب المستخدم:
 {user_text!r}
@@ -328,28 +352,34 @@ class WebSearchEngine:
 النية:
 {json.dumps(intent, ensure_ascii=False)}
 
-الاستعلامات المستقلة:
-{json.dumps(query_list, ensure_ascii=False)}
-
-الأولوية:
-1) المتاجر الأردنية
-2) المتاجر التي تشحن إلى الأردن
-3) المتاجر الإقليمية
-4) المتاجر العالمية
-
+ابحث عن صفحات منتجات حقيقية قابلة للشراء، وليس صفحات التصنيف أو الرئيسية أو نتائج البحث.
+الأولوية لمتاجر الأردن، ثم المتاجر التي تشحن إلى الأردن.
 مرادفات مهمة:
-بنطال = بنطال/بنطلون/سروال/pants/trousers/jeans
-ستيّانة = ستيانة/ستيانه/سوتيان/برا/حمالة صدر/صدرية/bra/bras
+- كندرة/شوز/حذاء = shoe/shoes/sneakers/flats/boots
+- سودة/سوده/اسود/أسود = black
+- بنطال/بنطلون/سروال = pants/trousers/jeans
+- ستيانة/سوتيان/برا/حمالة صدر = bra/bras/wireless bra
 
-أعد قائمة مختصرة من صفحات منتجات حقيقية وجدتها أثناء البحث.
-اذكر اسم المنتج والمتجر والسعر فقط عندما يظهر في المصدر.
-يجب أن تكون كل نتيجة مرتبطة بمصدر ويب حقيقي.
-لا تستخدم الصفحة الرئيسية أو صفحة نتائج البحث إذا كانت صفحة المنتج متاحة.
+قواعد:
+- لا تخترع أي رابط.
+- كل URL يجب أن يكون مصدرًا عثرت عليه أثناء البحث.
+- لا تجعل السعر إلزاميًا في نتيجة الاكتشاف؛ سنفتح الصفحة ونقرأ السعر بأنفسنا.
+- لا تكرر نفس URL.
 """
 
-        candidates: List[Dict[str, Any]] = []
-        seen: set = set()
-        errors: List[str] = []
+        def add_candidate(url: Any, title: str = "", search_query: str = "") -> None:
+            normalized = canonicalize_url(url)
+            if not normalized or normalized in avoid or normalized in seen:
+                return
+            seen.add(normalized)
+            candidates.append({
+                "source_url": normalized,
+                "search_query": search_query or " | ".join(query_list[:4]),
+                "search_rank": len(candidates) + 1,
+                "source_domain": domain_of(normalized),
+                "discovered_at": time.time(),
+                "grounding_title": str(title or "")[:180],
+            })
 
         try:
             if hasattr(client, "interactions"):
@@ -357,138 +387,63 @@ class WebSearchEngine:
                     model=self.deps.model_name,
                     input=prompt,
                     tools=[{"type": "google_search"}],
+                    response_format={
+                        "type": "text",
+                        "mime_type": "application/json",
+                        "schema": schema,
+                    },
                 )
 
-                sources: List[Dict[str, str]] = []
-                search_result_urls: List[str] = []
+                # 1) Parse the structured output. Google documents structured
+                # output + Google Search for Gemini 3-series models.
+                try:
+                    data = json.loads(str(getattr(interaction, "output_text", "") or "{}"))
+                except Exception:
+                    data = {}
 
+                for item in (data.get("products", []) if isinstance(data, dict) else []):
+                    if isinstance(item, dict):
+                        add_candidate(item.get("url"), item.get("title") or "", item.get("merchant") or "")
+
+                # 2) Also read official search-result steps and model annotations.
                 for step in getattr(interaction, "steps", None) or []:
-                    step_type = str(getattr(step, "type", "") or "")
+                    result_value = getattr(step, "result", None)
+                    self._collect_result_urls(result_value, add_candidate)
 
-                    if step_type == "google_search_result":
-                        result_value = getattr(step, "result", None)
-                        blocks = result_value if isinstance(result_value, list) else [result_value]
-                        for block in blocks:
-                            self._collect_urls_from_value(block, search_result_urls)
+                    content_blocks = getattr(step, "content", None) or []
+                    for block in content_blocks:
+                        for annotation in getattr(block, "annotations", None) or []:
+                            uri = getattr(annotation, "uri", None) or getattr(annotation, "url", None)
+                            title = getattr(annotation, "title", None) or ""
+                            add_candidate(uri, title)
 
-                    if step_type == "model_output":
-                        contents = getattr(step, "content", None) or []
-                        for block in contents:
-                            if str(getattr(block, "type", "") or "") != "text":
-                                continue
+                        text_value = str(getattr(block, "text", "") or "")
+                        for raw_url in re.findall(r"https?://\S+", text_value):
+                            add_candidate(raw_url)
 
-                            annotations = getattr(block, "annotations", None) or []
-                            for annotation in annotations:
-                                uri = getattr(annotation, "uri", None) or getattr(annotation, "url", None)
-                                title = getattr(annotation, "title", None) or ""
-                                normalized = canonicalize_url(uri)
-                                if normalized and normalized not in {x["url"] for x in sources}:
-                                    sources.append({"url": normalized, "title": str(title)[:180]})
-
-                            text_value = str(getattr(block, "text", "") or "")
-                            search_result_urls.extend(re.findall(r"https?://\S+", text_value))
-
-                # Keep both citation annotations and any explicit result URLs.
-                all_urls = [x["url"] for x in sources] + search_result_urls
-
-                for source_rank, raw_url in enumerate(all_urls, start=1):
-                    url = canonicalize_url(raw_url)
-                    if not url or url in avoid or url in seen:
-                        continue
-                    seen.add(url)
-                    title = next((x["title"] for x in sources if x["url"] == url), "")
-                    candidates.append({
-                        "source_url": url,
-                        "search_query": " | ".join(query_list[:4]),
-                        "search_rank": source_rank,
-                        "source_domain": domain_of(url),
-                        "discovered_at": time.time(),
-                        "grounding_title": title,
-                    })
+                # 3) Generic model dump fallback catches SDK enum/shape changes.
+                self._collect_urls_generic(interaction, add_candidate)
             else:
-                # Compatibility path for older google-genai SDK installations.
+                # Compatibility path for older SDKs.
                 response = client.models.generate_content(
                     model=self.deps.model_name,
                     contents=prompt,
                     config=genai_types.GenerateContentConfig(
-                        tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())]
+                        tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+                        temperature=0.1,
                     ) if genai_types else None,
                 )
                 sources = self.deps.grounding_source_extractor(response) if self.deps.grounding_source_extractor else self._grounding_sources(response)
                 text_response = getattr(response, "text", "") or ""
-                urls = [x.get("url") for x in sources if x.get("url")]
-                urls.extend(re.findall(r"https?://\S+", text_response))
-                for source_rank, raw_url in enumerate(urls, start=1):
-                    url = canonicalize_url(raw_url)
-                    if not url or url in avoid or url in seen:
-                        continue
-                    seen.add(url)
-                    candidates.append({
-                        "source_url": url,
-                        "search_query": " | ".join(query_list[:4]),
-                        "search_rank": source_rank,
-                        "source_domain": domain_of(url),
-                        "discovered_at": time.time(),
-                        "grounding_title": next((x.get("title", "") for x in sources if x.get("url") == url), ""),
-                    })
+                for source in sources:
+                    add_candidate(source.get("url"), source.get("title") or "")
+                for raw_url in re.findall(r"https?://\S+", text_response):
+                    add_candidate(raw_url)
         except Exception as exc:
             errors.append(f"discovery:{type(exc).__name__}")
-            LOGGER.warning("Product search discovery failed: %s", exc)
+            LOGGER.warning("Product discovery failed: %s", exc)
 
-        # A second, compact interaction is used only if the first call exposed no URLs.
-        if not candidates and hasattr(client, "interactions"):
-            try:
-                rescue = client.interactions.create(
-                    model=self.deps.model_name,
-                    input=f"""
-ابحث الآن على Google عن منتجات حقيقية مطابقة للطلب التالي:
-{user_text!r}
-
-استخدم هذه الاستعلامات:
-{json.dumps(query_list, ensure_ascii=False)}
-
-أريد فقط روابط صفحات المنتجات الحقيقية التي وجدتَها في نتائج البحث.
-اذكر كل رابط كاملًا في سطر منفصل.
-لا تخترع روابط.
-الأولوية للأردن.
-""",
-                    tools=[{"type": "google_search"}],
-                )
-                raw_output = str(getattr(rescue, "output_text", "") or "")
-                for step in getattr(rescue, "steps", None) or []:
-                    for block in getattr(step, "content", None) or []:
-                        raw_output += "\n" + str(getattr(block, "text", "") or "")
-                        for annotation in getattr(block, "annotations", None) or []:
-                            uri = getattr(annotation, "uri", None) or getattr(annotation, "url", None)
-                            title = getattr(annotation, "title", None) or ""
-                            url = canonicalize_url(uri)
-                            if url and url not in avoid and url not in seen:
-                                seen.add(url)
-                                candidates.append({
-                                    "source_url": url,
-                                    "search_query": " | ".join(query_list[:4]),
-                                    "search_rank": len(candidates) + 1,
-                                    "source_domain": domain_of(url),
-                                    "discovered_at": time.time(),
-                                    "grounding_title": str(title)[:180],
-                                })
-                for raw_url in re.findall(r"https?://\S+", raw_output):
-                    url = canonicalize_url(raw_url)
-                    if url and url not in avoid and url not in seen:
-                        seen.add(url)
-                        candidates.append({
-                            "source_url": url,
-                            "search_query": " | ".join(query_list[:4]),
-                            "search_rank": len(candidates) + 1,
-                            "source_domain": domain_of(url),
-                            "discovered_at": time.time(),
-                            "grounding_title": "",
-                        })
-            except Exception as exc:
-                errors.append(f"rescue:{type(exc).__name__}")
-                LOGGER.warning("Product discovery rescue failed: %s", exc)
-
-        return candidates[:32], {
+        return candidates[:40], {
             "status": "ok" if candidates else "no_candidates",
             "queries": query_list,
             "candidate_count": len(candidates),
@@ -496,25 +451,62 @@ class WebSearchEngine:
         }
 
     @staticmethod
-    def _collect_urls_from_value(value: Any, out: List[str]) -> None:
+    def _collect_result_urls(value: Any, add_candidate: Callable[..., None]) -> None:
         if value is None:
             return
-        if isinstance(value, str):
-            for url in re.findall(r"https?://\S+", value):
-                if url not in out:
-                    out.append(url)
-            return
         if isinstance(value, dict):
-            for key, item in value.items():
-                if str(key).lower() in {"url", "uri", "link"} and isinstance(item, str):
-                    if item not in out:
-                        out.append(item)
-                else:
-                    WebSearchEngine._collect_urls_from_value(item, out)
+            url = value.get("url") or value.get("uri") or value.get("link")
+            if isinstance(url, str):
+                title = value.get("title") or ""
+                add_candidate(url, str(title))
+            for item in value.values():
+                WebSearchEngine._collect_result_urls(item, add_candidate)
             return
         if isinstance(value, (list, tuple)):
             for item in value:
-                WebSearchEngine._collect_urls_from_value(item, out)
+                WebSearchEngine._collect_result_urls(item, add_candidate)
+            return
+        for attr in ("url", "uri", "link"):
+            v = getattr(value, attr, None)
+            if isinstance(v, str):
+                title = getattr(value, "title", "") or ""
+                add_candidate(v, str(title))
+        for attr in ("result", "items", "content", "annotations"):
+            nested = getattr(value, attr, None)
+            if nested is not None:
+                WebSearchEngine._collect_result_urls(nested, add_candidate)
+
+    @staticmethod
+    def _collect_urls_generic(value: Any, add_candidate: Callable[..., None]) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            for raw_url in re.findall(r"https?://\S+", value):
+                add_candidate(raw_url)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).lower() in {"url", "uri", "link", "source"} and isinstance(item, str):
+                    add_candidate(item)
+                else:
+                    WebSearchEngine._collect_urls_generic(item, add_candidate)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                WebSearchEngine._collect_urls_generic(item, add_candidate)
+            return
+
+        try:
+            if hasattr(value, "model_dump"):
+                WebSearchEngine._collect_urls_generic(value.model_dump(), add_candidate)
+            elif hasattr(value, "dict"):
+                WebSearchEngine._collect_urls_generic(value.dict(), add_candidate)
+            else:
+                raw = str(value)
+                for raw_url in re.findall(r"https?://\S+", raw):
+                    add_candidate(raw_url)
+        except Exception:
+            pass
 
     @staticmethod
     def _grounding_sources(response: Any) -> List[Dict[str, str]]:
@@ -855,20 +847,18 @@ class ProductVerifier:
         categories = list(intent.get("categories", []))
         terms = normalized_terms(list(intent.get("product_terms", [])) + list(intent.get("synonyms", [])))
 
+        category_match = False
         if categories:
-            category_text = " ".join(CATEGORY_KEYWORDS.get(categories[0], []))
-            if category_text and not any(normalize_text(x) in body for x in CATEGORY_KEYWORDS.get(categories[0], [])):
-                # URLs/titles can be English while extracted category is vague. Require
-                # at least one semantic product term before treating as a category mismatch.
-                if not any(x in body for x in terms[:20]):
-                    return False, "wrong_category"
+            category_words = CATEGORY_KEYWORDS.get(categories[0], [])
+            category_match = any(normalize_text(x) in body for x in category_words)
+            if not category_match and not any(x in body for x in terms[:20]):
+                return False, "wrong_category"
 
-        if terms:
-            overlap = 0
-            for term in terms[:30]:
-                nt = normalize_text(term)
-                if nt and nt in body:
-                    overlap += 1
+        # Do not reject a product solely because the store uses a translated,
+        # abbreviated, or brand-specific title. Category match is sufficient evidence
+        # to continue to hard filters/ranking.
+        if terms and not category_match:
+            overlap = sum(1 for term in terms[:30] if term and term in body)
             if overlap == 0:
                 return False, "low_relevance"
 
