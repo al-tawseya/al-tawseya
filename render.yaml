@@ -11,8 +11,12 @@ services:
       - key: PAYMENT_WEBHOOK_SECRET
         sync: false
       - key: GEMINI_MODEL
-        value: gemini-2.5-flash
+        value: gemini-3.8-flash
       - key: LIVE_SEARCH_ENABLED
         value: "true"
       - key: LIVE_SEARCH_MAX
         value: "8"
+      - key: SEARCH_QUERY_COUNT
+        value: "5"
+      - key: SEARCH_CACHE_TTL
+        value: "180"
