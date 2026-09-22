@@ -1505,7 +1505,7 @@ def upsert_live_offers(items: Sequence[Dict[str, Any]]) -> List[int]:
                     item.get("store_url", ""), "google_search",
                 )
                 if existing:
-                    conn.execute('''UPDATE merchant_offers SET merchant_name=?,title=?,category=?,price_jod=?,tags=?,colors=?,style=?,city=?,description=?,image_url=?,whatsapp_url=?,instagram_url=?,store_url=?,sizes=?,size_system=?,source_url=?,source=?,last_checked=CURRENT_TIMESTAMP,verification_status='verified',verified_url=?,verified_at=CURRENT_TIMESTAMP WHERE id=?''', values + (oid,))
+                    conn.execute('''UPDATE merchant_offers SET merchant_name=?,title=?,category=?,price_jod=?,tags=?,colors=?,style=?,city=?,description=?,image_url=?,whatsapp_url=?,instagram_url=?,store_url=?,sizes=?,size_system=?,source_url=?,source=?,last_checked=CURRENT_TIMESTAMP,verification_status='verified',verified_url=?,verified_at=CURRENT_TIMESTAMP WHERE id=?''', values + (item.get("store_url", ""), oid))
                 else:
                     conn.execute('''INSERT INTO merchant_offers (id,merchant_name,title,category,price_jod,tags,colors,style,city,description,image_url,whatsapp_url,instagram_url,store_url,sizes,size_system,source_url,source,verification_status,verified_url,verified_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (oid,) + values + ("verified", item.get("store_url", ""), time.strftime("%Y-%m-%d %H:%M:%S")))
             conn.commit()
