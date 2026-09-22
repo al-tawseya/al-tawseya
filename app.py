@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import ipaddress
 import hmac
 import json
 import logging
@@ -10,14 +11,16 @@ import os
 import re
 import secrets
 import sqlite3
+import csv
 import threading
 import time
 import traceback
+import urllib.request
 import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urljoin
 
 try:
     from google import genai  # type: ignore
@@ -49,6 +52,8 @@ DEAL_PRICE_JOD = float(os.getenv("DEAL_PRICE_JOD", "1"))
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 PAYMENT_WEBHOOK_SECRET = os.getenv("PAYMENT_WEBHOOK_SECRET", "").strip()
 AUTH_DAYS = int(os.getenv("AUTH_DAYS", "30"))
+LIVE_SEARCH_ENABLED = os.getenv("LIVE_SEARCH_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+LIVE_SEARCH_MAX = max(4, min(10, int(os.getenv("LIVE_SEARCH_MAX", "8"))))
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +656,176 @@ def detect_product_terms(text: str) -> List[str]:
 _GEMINI_CLIENT: Any = None
 
 
+def fallback_image_url(offer_id: int) -> str:
+    return f"/media/offers/{int(offer_id)}.svg"
+
+
+def safe_public_url(url: str) -> bool:
+    try:
+        parsed = urlparse((url or "").strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        host = parsed.hostname.strip().lower().rstrip(".")
+        if host in {"localhost", "localhost.localdomain"}:
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+                return False
+            return True
+        except ValueError:
+            pass
+        return not host.endswith((".local", ".internal", ".lan"))
+    except Exception:
+        return False
+
+
+def normalize_external_url(url: Any) -> str:
+    value = str(url or "").strip()
+    return value if safe_public_url(value) else ""
+
+
+def fetch_open_graph_image(page_url: str) -> str:
+    page_url = normalize_external_url(page_url)
+    if not page_url:
+        return ""
+    try:
+        req = urllib.request.Request(page_url, headers={"User-Agent": "Mozilla/5.0 AlTawseya/6.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            final_url = resp.geturl()
+            if not safe_public_url(final_url):
+                return ""
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if "text/html" not in content_type:
+                return ""
+            raw = resp.read(700_000)
+        text = raw.decode("utf-8", errors="ignore")
+        patterns = [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text, re.I)
+            if m:
+                image = urljoin(final_url, html.unescape(m.group(1).strip()))
+                if safe_public_url(image):
+                    return image
+    except Exception as exc:
+        LOGGER.debug("OpenGraph image fetch skipped for %s: %s", page_url, exc)
+    return ""
+
+
+def offer_svg(offer: Optional[Offer]) -> bytes:
+    title = html.escape((offer.title if offer else "منتج")[:70])
+    merchant = html.escape((offer.merchant_name if offer else "التوصية")[:36])
+    category = html.escape(CATEGORY_LABELS.get(offer.category, offer.category) if offer else "عرض")
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 1000">
+<defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stop-color="#f5f5f5"/><stop offset="100%" stop-color="#e5e5e5"/></linearGradient></defs>
+<rect width="800" height="1000" fill="url(#g)"/><circle cx="400" cy="350" r="170" fill="#111" opacity=".08"/>
+<text x="400" y="300" text-anchor="middle" font-family="Tahoma,Arial" font-size="90" fill="#111">ت</text>
+<text x="400" y="690" text-anchor="middle" font-family="Tahoma,Arial" font-size="34" font-weight="700" fill="#111">{title}</text>
+<text x="400" y="748" text-anchor="middle" font-family="Tahoma,Arial" font-size="25" fill="#555">{merchant}</text>
+<text x="400" y="800" text-anchor="middle" font-family="Tahoma,Arial" font-size="22" fill="#777">{category}</text>
+<text x="400" y="920" text-anchor="middle" font-family="Tahoma,Arial" font-size="24" fill="#222">صورة مؤقتة — تُستبدل بصورة المتجر عند العثور عليها</text>
+</svg>"""
+    return svg.encode('utf-8')
+
+
+def _live_offer_id(url: str) -> int:
+    return 100000000 + (int(hashlib.sha256(url.encode('utf-8')).hexdigest()[:12], 16) % 89999999)
+
+
+def _extract_grounding_urls(response: Any) -> List[str]:
+    urls: List[str] = []
+    try:
+        for candidate in getattr(response, "candidates", None) or []:
+            metadata = getattr(candidate, "grounding_metadata", None)
+            for chunk in getattr(metadata, "grounding_chunks", None) or []:
+                web = getattr(chunk, "web", None)
+                uri = getattr(web, "uri", None) if web else None
+                if uri and safe_public_url(uri) and uri not in urls:
+                    urls.append(uri)
+    except Exception:
+        pass
+    return urls
+
+
+def live_search_offers(user_text: str, intent: Dict[str, Any], refresh_nonce: str = "", avoid_urls: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    client = gemini_model()
+    if client is None or not LIVE_SEARCH_ENABLED:
+        return []
+    avoid_urls = [u for u in (avoid_urls or []) if safe_public_url(u)]
+    avoid_block = "\n".join(f"- {u}" for u in avoid_urls[:30]) or "- لا يوجد"
+    prompt = f"""
+أنت وكيل بحث تسوق حي للسوق الأردني. استخدم Google Search للبحث الفعلي على الويب الآن، وليس من الذاكرة فقط.
+طلب المستخدم الأصلي: {user_text!r}
+النوايا المستخرجة: {json.dumps(_intent_public(intent), ensure_ascii=False)}
+رقم تنويع البحث: {refresh_nonce!r}
+الروابط التي ظهرت في البحث السابق ويجب عدم إعادتها:
+{avoid_block}
+
+أعد JSON فقط بالشكل:
+{{"offers":[{{"title":"اسم المنتج الحقيقي","merchant_name":"اسم المتجر الحقيقي","category":"makeup|clothes|gifts|watches|perfumes|shoes|lingerie|scarves","price_jod":رقم أو null,"description":"وصف قصير مبني على الصفحة","city":"عمّان أو المدينة إن ظهرت أو الأردن","source_url":"الرابط الكامل لصفحة المنتج/العرض","image_url":"رابط صورة مباشرة إن وجد وإلا فارغ","tags":[],"colors":[],"style":[],"sizes":[],"size_system":""}}]}}
+
+قواعد صارمة:
+1) اعتمد فقط منتجات/عروضًا وجدت رابطها في نتائج Google Search.
+2) لا تخترع متجرًا أو رابطًا أو سعرًا. إذا لم تجد سعرًا واضحًا استخدم null، ويفضل حذف المنتج إذا كان السعر غير واضح.
+3) فضّل المتاجر الأردنية أو التي تبيع/تشحن إلى الأردن، وفضّل صفحات المنتجات لا صفحات التواصل العامة.
+4) لا تعيد أي source_url من قائمة الروابط السابقة.
+5) أعطني {LIVE_SEARCH_MAX} نتائج أو أقل حسب ما تجده فعليًا.
+6) اجعل النتائج متنوعة بين متاجر مختلفة قدر الإمكان.
+"""
+    try:
+        config = genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+        ) if genai_types else None
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
+        data = json.loads(getattr(response, "text", "{}") or "{}")
+        candidates = data.get("offers", []) if isinstance(data, dict) else []
+        if not candidates:
+            candidates = [{"source_url": u} for u in _extract_grounding_urls(response)[:LIVE_SEARCH_MAX]]
+        out: List[Dict[str, Any]] = []
+        seen = set(avoid_urls)
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            url = normalize_external_url(item.get("source_url"))
+            if not url or url in seen:
+                continue
+            price = safe_float(item.get("price_jod"))
+            if price is None or price <= 0:
+                continue
+            title = str(item.get("title") or "").strip()[:180]
+            if len(title) < 3:
+                continue
+            merchant = str(item.get("merchant_name") or "").strip()[:100] or (urlparse(url).hostname or "متجر")
+            image = normalize_external_url(item.get("image_url")) or fetch_open_graph_image(url)
+            oid = _live_offer_id(url)
+            category = str(item.get("category") or "gifts").strip()
+            if category not in CATEGORY_LABELS:
+                category = next(iter(detect_categories(title + " " + str(item.get("description") or ""))), "gifts")
+            out.append({
+                "id": oid, "merchant_name": merchant, "title": title, "category": category,
+                "price_jod": round(price, 2), "tags": _as_list(item.get("tags")), "colors": _as_list(item.get("colors")),
+                "style": _as_list(item.get("style")), "city": str(item.get("city") or "الأردن")[:60],
+                "description": str(item.get("description") or "عرض تم العثور عليه عبر البحث المباشر")[:360],
+                "image_url": image or fallback_image_url(oid), "whatsapp_url": "", "instagram_url": "",
+                "sizes": _as_list(item.get("sizes")), "size_system": str(item.get("size_system") or ""),
+                "store_url": url, "source": "google_search",
+            })
+            seen.add(url)
+            if len(out) >= LIVE_SEARCH_MAX:
+                break
+        return out
+    except Exception as exc:
+        LOGGER.warning("Live Google Search failed; using internal inventory: %s", exc)
+        return []
+
+
+
 def gemini_model() -> Any:
     global _GEMINI_CLIENT
     if _GEMINI_CLIENT is not None:
@@ -909,6 +1084,9 @@ whatsapp_url TEXT NOT NULL,
 instagram_url TEXT NOT NULL,
 sizes TEXT NOT NULL DEFAULT '[]',
 size_system TEXT NOT NULL DEFAULT '',
+source_url TEXT NOT NULL DEFAULT '',
+source TEXT NOT NULL DEFAULT 'seed',
+last_checked TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -968,6 +1146,15 @@ approved_by TEXT
 CREATE INDEX IF NOT EXISTS idx_deal_access_session ON deal_access(session_id);
 CREATE INDEX IF NOT EXISTS idx_deal_access_offer ON deal_access(offer_id);
 CREATE INDEX IF NOT EXISTS idx_deal_access_status ON deal_access(status);
+
+CREATE TABLE IF NOT EXISTS session_offers (
+session_id TEXT NOT NULL,
+offer_id INTEGER NOT NULL,
+rank_order INTEGER NOT NULL DEFAULT 0,
+created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+PRIMARY KEY (session_id, offer_id)
+);
+CREATE INDEX IF NOT EXISTS idx_session_offers_session ON session_offers(session_id);
 
 CREATE TABLE IF NOT EXISTS users (
 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1069,6 +1256,9 @@ def init_db() -> None:
                 "sizes": "TEXT NOT NULL DEFAULT '[]'",
                 "size_system": "TEXT NOT NULL DEFAULT ''",
                 "store_url": "TEXT NOT NULL DEFAULT ''",
+                "source_url": "TEXT NOT NULL DEFAULT ''",
+                "source": "TEXT NOT NULL DEFAULT 'seed'",
+                "last_checked": "TEXT NOT NULL DEFAULT ''",
             })
             _ensure_columns(conn, "sessions", {
                 "user_id": "INTEGER",
@@ -1086,21 +1276,22 @@ def init_db() -> None:
             rows = [(
                 o.id, o.merchant_name, o.title, o.category, o.price_jod,
                 serialize_json(o.tags), serialize_json(o.colors), serialize_json(o.style),
-                o.city, o.description, o.image_url, o.whatsapp_url, o.instagram_url, o.store_url,
-                serialize_json(o.sizes), o.size_system,
+                o.city, o.description, (o.image_url if safe_public_url(o.image_url) and o.image_url.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) else fallback_image_url(o.id)), o.whatsapp_url, o.instagram_url, o.store_url,
+                serialize_json(o.sizes), o.size_system, "", "seed",
             ) for o in SEED_OFFERS]
             conn.executemany(
                 """
                 INSERT OR IGNORE INTO merchant_offers
                 (id, merchant_name, title, category, price_jod, tags, colors, style, city,
-                 description, image_url, whatsapp_url, instagram_url, store_url, sizes, size_system)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 description, image_url, whatsapp_url, instagram_url, store_url, sizes, size_system, source_url, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
             conn.execute("UPDATE merchant_offers SET whatsapp_url = '' WHERE whatsapp_url IN ('https://wa.me','http://wa.me','wa.me')")
             conn.execute("UPDATE merchant_offers SET instagram_url = '' WHERE instagram_url IN ('https://instagram.com','http://instagram.com','instagram.com')")
-            conn.execute("UPDATE merchant_offers SET store_url = '' WHERE store_url IS NULL")
+            conn.execute("UPDATE merchant_offers SET store_url = '' WHERE store_url IS NULL OR store_url IN ('https://wa.me','http://wa.me','https://instagram.com','http://instagram.com','wa.me','instagram.com')")
+            conn.execute("UPDATE merchant_offers SET image_url = ('/media/offers/' || id || '.svg') WHERE image_url IN ('https://unsplash.com','http://unsplash.com','unsplash.com','https://www.unsplash.com','http://www.unsplash.com','www.unsplash.com','unsplash.com/') OR image_url IS NULL OR image_url = ''")
             conn.commit()
             count = conn.execute("SELECT COUNT(*) FROM merchant_offers").fetchone()[0]
             LOGGER.info("DB ready at %s — %d offers", DB_PATH, count)
@@ -1206,7 +1397,7 @@ def get_offer_by_id(offer_id: int) -> Optional[Offer]:
             category=row["category"], price_jod=row["price_jod"],
             tags=read_json_list(row["tags"]), colors=read_json_list(row["colors"]),
             style=read_json_list(row["style"]), city=row["city"],
-            description=row["description"], image_url=row["image_url"],
+            description=row["description"], image_url=(row["image_url"] or fallback_image_url(int(row["id"]))),
             whatsapp_url=row["whatsapp_url"], instagram_url=row["instagram_url"],
             sizes=read_json_list(row["sizes"]) if "sizes" in row.keys() else [],
             size_system=row["size_system"] if "size_system" in row.keys() else "",
@@ -1228,12 +1419,66 @@ def get_deal(deal_id: str) -> Optional[sqlite3.Row]:
         conn.close()
 
 
+def save_session_offers(session_id: str, result_ids: Sequence[int]) -> None:
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            conn.execute("DELETE FROM session_offers WHERE session_id = ?", (session_id,))
+            for idx, offer_id in enumerate(result_ids):
+                conn.execute("INSERT OR REPLACE INTO session_offers (session_id, offer_id, rank_order) VALUES (?, ?, ?)", (session_id, int(offer_id), idx))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def offer_urls_for_ids(ids: Sequence[int]) -> List[str]:
+    ids = [int(x) for x in ids if str(x).isdigit()]
+    if not ids:
+        return []
+    conn = get_connection()
+    try:
+        marks = ",".join("?" for _ in ids)
+        rows = conn.execute(f"SELECT store_url FROM merchant_offers WHERE id IN ({marks})", ids).fetchall()
+        return [str(r["store_url"]) for r in rows if safe_public_url(str(r["store_url"] or ""))]
+    finally:
+        conn.close()
+
+
+def upsert_live_offers(items: Sequence[Dict[str, Any]]) -> List[int]:
+    ids: List[int] = []
+    with DB_LOCK:
+        conn = get_connection()
+        try:
+            for item in items:
+                oid = int(item["id"]); ids.append(oid)
+                existing = conn.execute("SELECT id FROM merchant_offers WHERE id=?", (oid,)).fetchone()
+                values = (
+                    item["merchant_name"], item["title"], item["category"], float(item["price_jod"]),
+                    serialize_json(item.get("tags", [])), serialize_json(item.get("colors", [])), serialize_json(item.get("style", [])),
+                    item.get("city", "الأردن"), item.get("description", ""), item.get("image_url") or fallback_image_url(oid),
+                    "", "", item.get("store_url", ""), serialize_json(item.get("sizes", [])), item.get("size_system", ""),
+                    item.get("store_url", ""), "google_search",
+                )
+                if existing:
+                    conn.execute('''UPDATE merchant_offers SET merchant_name=?,title=?,category=?,price_jod=?,tags=?,colors=?,style=?,city=?,description=?,image_url=?,whatsapp_url=?,instagram_url=?,store_url=?,sizes=?,size_system=?,source_url=?,source=?,last_checked=CURRENT_TIMESTAMP WHERE id=?''', values + (oid,))
+                else:
+                    conn.execute('''INSERT INTO merchant_offers (id,merchant_name,title,category,price_jod,tags,colors,style,city,description,image_url,whatsapp_url,instagram_url,store_url,sizes,size_system,source_url,source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (oid,) + values)
+            conn.commit()
+        finally:
+            conn.close()
+    return ids
+
+
 def create_or_get_deal(session_id: str, offer_id: int) -> Optional[Dict[str, Any]]:
     intent = get_session_intent(session_id)
     if intent is None:
         return None
-    recommended_ids = {int(item["id"]) for item in recommend(intent)}
-    if offer_id not in recommended_ids:
+    conn_check = get_connection()
+    try:
+        allowed = conn_check.execute("SELECT 1 FROM session_offers WHERE session_id=? AND offer_id=?", (session_id, offer_id)).fetchone()
+    finally:
+        conn_check.close()
+    if not allowed:
         return None
 
     with DB_LOCK:
@@ -1372,6 +1617,71 @@ def update_offer_links(offer_id: int, store_url: str, whatsapp_url: str, instagr
         finally:
             conn.close()
 
+
+
+def bulk_update_offer_links(raw_text: str) -> Dict[str, Any]:
+    """Bulk-update offer URLs.
+
+    Accepted formats per line:
+      30|https://example.com
+      30,https://example.com
+      30|https://store|https://wa.me/...|https://instagram.com/...|https://image...
+    A CSV header row is allowed. Blank/comment lines are ignored.
+    """
+    import io
+    text = (raw_text or "").strip()
+    if not text:
+        raise ValueError("الصق قائمة الروابط أولاً.")
+
+    rows = []
+    for line in text.splitlines():
+        line=line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '|' in line:
+            parts=[x.strip() for x in line.split('|')]
+        else:
+            try:
+                parts=next(csv.reader([line]))
+                parts=[x.strip() for x in parts]
+            except Exception:
+                parts=[x.strip() for x in line.split(',')]
+        if not parts:
+            continue
+        first=parts[0].lower()
+        if first in {'id','offer_id','deal_id','رقم','رقم الإعلان'}:
+            continue
+        try:
+            offer_id=int(parts[0])
+        except Exception:
+            raise ValueError(f"رقم الإعلان غير صالح في السطر: {line}")
+        store_url=parts[1] if len(parts)>1 else ''
+        whatsapp_url=parts[2] if len(parts)>2 else None
+        instagram_url=parts[3] if len(parts)>3 else None
+        image_url=parts[4] if len(parts)>4 else None
+        rows.append((offer_id, store_url, whatsapp_url, instagram_url, image_url))
+
+    if not rows:
+        raise ValueError("لم أجد أي أسطر صالحة.")
+
+    updated=[]; skipped=[]
+    with DB_LOCK:
+        conn=get_connection()
+        try:
+            for offer_id, store_url, wa, ig, img in rows:
+                exists=conn.execute("SELECT whatsapp_url, instagram_url, image_url FROM merchant_offers WHERE id=?", (offer_id,)).fetchone()
+                if not exists:
+                    skipped.append(offer_id); continue
+                if wa is None: wa=exists[0] or ''
+                if ig is None: ig=exists[1] or ''
+                if img is None: img=exists[2] or ''
+                # Reuse single-offer validation.
+                ok=update_offer_links(offer_id, store_url, wa, ig, img)
+                if ok: updated.append(offer_id)
+            conn.commit()
+        finally:
+            conn.close()
+    return {"updated": updated, "skipped": skipped, "count": len(updated)}
 
 def list_admin_offers() -> List[Dict[str, Any]]:
     ensure_db()
@@ -1722,7 +2032,9 @@ def _admin_page() -> str:
 <div id="loginBox" class="bg-white rounded-3xl p-5 border shadow-sm"><div class="font-black text-lg">تسجيل دخول الإدارة</div><div class="mt-4 flex gap-2"><input id="adminPassword" type="password" class="flex-1 rounded-xl bg-neutral-100 px-4 py-3 outline-none" placeholder="كلمة مرور الإدارة"><button onclick="login()" class="rounded-xl bg-neutral-950 text-white px-5 font-black">دخول</button></div><div id="loginMsg" class="text-sm mt-3"></div></div>
 <div id="panel" class="hidden">
 <section class="mt-6 bg-white rounded-3xl p-5 border shadow-sm"><div class="flex items-center justify-between gap-3"><div><h2 class="text-xl font-black">سلات/دفعات قيد التحقق</h2><p class="text-sm text-neutral-500">قارني الاسم والمبلغ مع حركة CliQ التي وصلت لحسابك ثم اعتمدي الدفعة كاملة.</p></div><button onclick="loadAll()" class="rounded-xl bg-neutral-100 px-4 py-2 font-black">تحديث</button></div><div id="batches" class="mt-4 space-y-3"></div></section>
-<section class="mt-6 bg-white rounded-3xl p-5 border shadow-sm"><div><h2 class="text-xl font-black">روابط الإعلانات</h2><p class="text-sm text-neutral-500">أضيفي رابط المتجر الحقيقي لكل إعلان. الرابط العام مثل wa.me أو instagram.com لن يُقبل.</p></div><div id="offers" class="mt-4 space-y-4"></div></section>
+<section class="mt-6 bg-white rounded-3xl p-5 border shadow-sm"><div><h2 class="text-xl font-black">روابط الإعلانات — تحديث جماعي</h2><p class="text-sm text-neutral-500">لا حاجة لتعديل 42 إعلانًا واحدًا واحدًا. الصق الروابط دفعة واحدة بصيغة <b>رقم الإعلان|الرابط</b>، سطر لكل إعلان. مثال: <code>30|https://example.com</code></p><div class="mt-3 flex flex-wrap gap-2"><button onclick="downloadTemplate()" class="rounded-xl bg-neutral-100 px-4 py-2 font-black">تحميل قالب 42 إعلانًا</button><button onclick="bulkSave()" class="rounded-xl bg-neutral-950 text-white px-4 py-2 font-black">حفظ الروابط دفعة واحدة</button></div><textarea id="bulkLinks" class="mt-3 w-full min-h-56 rounded-2xl bg-neutral-100 p-4 font-mono text-sm" dir="ltr" placeholder="1|https://example.com
+2|https://example.com
+30|https://example.com"></textarea><div id="bulkMsg" class="mt-2 text-sm"></div></div><details class="mt-5"><summary class="cursor-pointer font-black">تعديل إعلان واحد يدويًا (اختياري)</summary><div id="offers" class="mt-4 space-y-4"></div></details></section>
 <section class="mt-6 bg-white rounded-3xl p-5 border shadow-sm"><div><h2 class="text-xl font-black">صندوق الاقتراحات</h2><p class="text-sm text-neutral-500">آخر اقتراحات المستخدمين.</p></div><div id="suggestions" class="mt-4 space-y-3"></div></section>
 </div></main>
 <script>
@@ -1734,6 +2046,8 @@ async function loadBatches(){const d=await api('/api/admin/pending-batches',{pas
 async function decideBatch(id,action){if(action==='paid'&&!confirm('هل تأكدتِ من وصول المبلغ المطلوب؟'))return;try{await api('/api/admin/batch-decision',{password,batch_id:id,action});loadAll();}catch(e){alert(e.message);}}
 async function loadOffers(){const d=await api('/api/admin/offers',{password});document.getElementById('offers').innerHTML=d.offers.map(x=>`<article class="rounded-2xl border p-4"><div class="font-black">#${x.id} — ${esc(x.merchant_name)} — ${esc(x.title)}</div><div class="text-xs mt-1 ${x.store_url?'text-emerald-600':'text-red-600'}">${x.store_url?'رابط المتجر مضبوط':'رابط المتجر غير مضاف بعد'}</div><div class="grid md:grid-cols-4 gap-2 mt-3"><input data-id="${x.id}" data-field="store_url" value="${esc(x.store_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="رابط المتجر الحقيقي"><input data-id="${x.id}" data-field="whatsapp_url" value="${esc(x.whatsapp_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="واتساب"><input data-id="${x.id}" data-field="instagram_url" value="${esc(x.instagram_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="إنستغرام"><input data-id="${x.id}" data-field="image_url" value="${esc(x.image_url)}" class="rounded-xl bg-neutral-100 px-3 py-3 text-sm" placeholder="رابط الصورة"><button onclick="saveOffer(${x.id})" class="rounded-xl bg-neutral-950 text-white px-4 py-3 font-black md:col-span-4">حفظ</button></div></article>`).join('');}
 async function saveOffer(id){const get=f=>document.querySelector(`[data-id="${id}"][data-field="${f}"]`).value;try{await api('/api/admin/offer-update',{password,offer_id:id,store_url:get('store_url'),whatsapp_url:get('whatsapp_url'),instagram_url:get('instagram_url'),image_url:get('image_url')});alert('تم الحفظ');loadOffers();}catch(e){alert(e.message);}}
+function downloadTemplate(){fetch('/api/admin/offers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})}).then(r=>r.json()).then(d=>{let csv='id,merchant_name,title,store_url\n'+d.offers.map(x=>`${x.id},"${String(x.merchant_name).replaceAll('\"','\"\"')}","${String(x.title).replaceAll('\"','\"\"')}",${x.store_url||''}`).join('\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='al-tawseya-offer-links.csv';a.click();URL.revokeObjectURL(a.href);}).catch(e=>alert(e.message));}
+async function bulkSave(){const text=document.getElementById('bulkLinks').value;const msg=document.getElementById('bulkMsg');msg.textContent='جارٍ الحفظ...';msg.className='mt-2 text-sm text-neutral-500';try{const d=await api('/api/admin/bulk-offer-links',{password,raw_text:text});msg.textContent=`تم تحديث ${d.count} إعلانًا.`+(d.skipped?.length?` الإعلانات غير الموجودة: ${d.skipped.join(', ')}`:'');msg.className='mt-2 text-sm text-emerald-700 font-bold';loadOffers();}catch(e){msg.textContent=e.message;msg.className='mt-2 text-sm text-red-600 font-bold';}}
 async function loadSuggestions(){const d=await api('/api/admin/suggestions',{password});document.getElementById('suggestions').innerHTML=d.suggestions.length?d.suggestions.map(x=>`<div class="rounded-2xl border p-4"><div class="text-sm font-black">${esc(x.full_name||'زائر')}</div><div class="text-xs text-neutral-400 mt-1">${esc(x.created_at||'')}</div><div class="mt-2">${esc(x.message)}</div></div>`).join(''):'<div class="rounded-2xl bg-neutral-50 p-5 text-sm text-neutral-500">لا يوجد اقتراحات بعد.</div>';}
 async function loadAll(){try{await Promise.all([loadBatches(),loadOffers(),loadSuggestions()]);}catch(e){alert(e.message);}}
 </script></body></html>
@@ -1927,26 +2241,49 @@ def score_offer(offer: Offer, intent: Dict[str, Any]) -> Tuple[float, List[str]]
     return max(0.0, min(100.0, round(score, 2))), (reasons or ["أقرب متاح لطلبك"])
 
 
-def recommend(intent: Dict[str, Any], raw_query: str = "") -> List[Dict[str, Any]]:
+def recommend(intent: Dict[str, Any], raw_query: str = "", refresh_nonce: str = "", avoid_ids: Optional[Sequence[int]] = None) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
+    avoid_set = {int(x) for x in (avoid_ids or []) if str(x).isdigit()}
     for offer in get_offers():
+        if offer.id in avoid_set:
+            continue
         score, reasons = score_offer(offer, intent)
         if score < 0:
             continue
         payload = asdict(offer)
-        payload.pop("whatsapp_url", None)
-        payload.pop("instagram_url", None)
-        payload.pop("store_url", None)
+        payload.pop("whatsapp_url", None); payload.pop("instagram_url", None); payload.pop("store_url", None)
+        payload["image_url"] = payload.get("image_url") or fallback_image_url(offer.id)
         payload["category_label"] = CATEGORY_LABELS.get(offer.category, offer.category)
-        payload["score"] = score
-        payload["reasons"] = reasons
+        payload["score"] = score; payload["reasons"] = reasons
         payload["match_type"] = "توصية دقيقة" if score >= 60 else "توصية قريبة"
         results.append(payload)
-    if intent.get("priority") == "cheapest":
-        results.sort(key=lambda item: (item["price_jod"], -item["score"], item["id"]))
+
+    live = live_search_offers(raw_query, intent, refresh_nonce, avoid_urls=offer_urls_for_ids(list(avoid_set))) if raw_query else []
+    if live:
+        live_ids = upsert_live_offers(live)
+        for item, oid in zip(live, live_ids):
+            live_offer = Offer(id=oid, merchant_name=item["merchant_name"], title=item["title"], category=item["category"], price_jod=item["price_jod"], tags=item.get("tags", []), colors=item.get("colors", []), style=item.get("style", []), city=item.get("city", "الأردن"), description=item.get("description", ""), image_url=item.get("image_url", fallback_image_url(oid)), whatsapp_url="", instagram_url="", sizes=item.get("sizes", []), size_system=item.get("size_system", ""), store_url=item.get("store_url", ""))
+            score, reasons = score_offer(live_offer, intent)
+            if score < 0: score, reasons = 55.0, ["نتيجة من بحث مباشر على الويب"]
+            payload = dict(item)
+            payload.pop("store_url", None); payload.pop("whatsapp_url", None); payload.pop("instagram_url", None)
+            payload["category_label"] = CATEGORY_LABELS.get(item["category"], item["category"])
+            payload["score"] = max(score, 55.0); payload["reasons"] = list(dict.fromkeys(["نتيجة حديثة من بحث مباشر على الويب"] + reasons))[:4]
+            payload["match_type"] = "بحث مباشر"; payload["image_url"] = item.get("image_url") or fallback_image_url(oid)
+            results.append(payload)
+        live_ids_set = set(live_ids)
+        live_results = [x for x in results if x["id"] in live_ids_set]
+        static_results = [x for x in results if x["id"] not in live_ids_set]
+        static_results.sort(key=lambda x: (-x["score"], x["price_jod"], x["id"]))
+        results = live_results + static_results[:max(4, LIVE_SEARCH_MAX // 2)]
     else:
-        results.sort(key=lambda item: (-item["score"], item["price_jod"], item["id"]))
-    return ai_rerank(raw_query, results) if raw_query else results
+        if intent.get("priority") == "cheapest":
+            results.sort(key=lambda item: (item["price_jod"], -item["score"], item["id"]))
+        else:
+            results.sort(key=lambda item: (-item["score"], item["price_jod"], item["id"]))
+        if raw_query:
+            results = ai_rerank(raw_query, results)
+    return results[:18]
 
 class PaymentProvider:
     """Interface — بدّلي الـ implementation لما يتوفر API رسمي."""
@@ -2061,7 +2398,7 @@ HTML_TEMPLATE = r"""
             <input id="refineInput" maxlength="500" autocomplete="off" class="flex-1 min-w-0 rounded-xl bg-neutral-50 px-4 py-3 outline-none focus:ring-2 focus:ring-neutral-900 text-sm font-bold" placeholder="عدّلي الطلب: بدي أرخص / أفخم / مش شرط الأسود" />
             <button type="submit" class="px-4 rounded-xl bg-neutral-100 hover:bg-neutral-200 font-black text-sm">حدّثي ↻</button>
           </div>
-        </form>
+        </form><button id="refreshResultsBtn" type="button" class="hidden mt-3 w-full min-h-[46px] rounded-2xl border border-neutral-200 bg-white hover:bg-neutral-50 font-black">🔄 خيارات جديدة من البحث المباشر</button>
         <button type="button" onclick="openSuggestion()" class="mt-3 text-xs font-black text-neutral-500 hover:text-neutral-900">💡 صندوق اقتراحات</button>
       </div>
 
@@ -2137,6 +2474,9 @@ const refineForm = document.getElementById('refineForm');
 const refineInput = document.getElementById('refineInput');
 const queryEl = document.getElementById('query');
 const searchBtn = document.getElementById('searchBtn');
+const refreshResultsBtn = document.getElementById('refreshResultsBtn');
+const LAST_QUERY_KEY='tawseya_last_query';
+const LAST_IDS_KEY='tawseya_last_result_ids';
 const grid = document.getElementById('grid');
 const empty = document.getElementById('empty');
 const loading = document.getElementById('loading');
@@ -2211,7 +2551,7 @@ const tags = (item.tags || []).slice(0, 5).map(tag => `<span class="rounded-full
 const reasons = (item.reasons || []).slice(0, 3).map(r => `<li class="flex items-start gap-1.5 text-[11px] text-emerald-700 font-bold leading-5"><span class="mt-0.5">✓</span><span>${esc(r)}</span></li>`).join('');
 const knownDeal = paidDeals[String(item.id)];
 const zone = knownDeal ? `<div class="flex gap-2">${protectedButtons(knownDeal)}</div>` : lockedZone();
-return ` <article data-offer-id="${item.id}" class="group bg-white rounded-[2rem] border border-neutral-200/70 overflow-hidden soft-shadow flex flex-col"><div class="relative aspect-[4/5] overflow-hidden bg-neutral-100"><img src="${esc(item.image_url)}" loading="lazy" referrerpolicy="no-referrer" class="h-full w-full object-cover transition duration-700 group-hover:scale-[1.03]" alt="${esc(item.title)}" onerror="this.style.opacity='.18'" /><div class="absolute inset-x-3 top-3 flex items-start justify-between gap-2"><span class="rounded-full bg-white/90 backdrop-blur px-3 py-1.5 text-[10px] font-black shadow-sm">${score}% توافق</span><span class="rounded-full bg-black/65 text-white backdrop-blur px-3 py-1.5 text-[10px] font-bold">${esc(item.match_type || 'توصية')}</span></div></div><div class="p-4 sm:p-5 flex-1 flex flex-col"><div class="flex items-center justify-between gap-2"><span class="text-[11px] text-neutral-400 font-black">${esc(categoryNames[item.category] || item.category)}</span><span class="text-[11px] text-neutral-400 font-bold">${esc(item.city)}</span></div><h4 class="mt-2 text-sm sm:text-base font-black leading-6">${esc(item.title)}</h4><div class="mt-1 text-xs text-neutral-400 font-bold">${esc(item.merchant_name)}</div><p class="mt-2 text-xs sm:text-sm text-neutral-500 leading-6">${esc(item.description)}</p><ul class="mt-3 space-y-1">${reasons}</ul><div class="mt-3 flex flex-wrap gap-1.5">${tags}</div><div class="mt-auto pt-4 flex items-end justify-between gap-3"><div><div class="text-[10px] text-neutral-400 font-bold">السعر</div><div class="text-lg font-black">${esc(money(item.price_jod))}</div></div><button type="button" onclick='openDeal(${JSON.stringify({id:item.id,title:item.title,price_jod:item.price_jod})})' class="min-h-[48px] px-4 rounded-2xl bg-neutral-950 hover:bg-neutral-800 text-white font-black text-xs sm:text-sm transition active:scale-[0.985]">إضافة للسلة <span class="opacity-60">(1 د)</span></button></div><div class="contact-zone relative mt-4 p-2 rounded-2xl border border-neutral-100 ${knownDeal ? '' : 'hide-links'}" data-card="${index}">${zone}</div></div></article>`;
+return ` <article data-offer-id="${item.id}" class="group bg-white rounded-[2rem] border border-neutral-200/70 overflow-hidden soft-shadow flex flex-col"><div class="relative aspect-[4/5] overflow-hidden bg-neutral-100"><img src="${esc(item.image_url)}" loading="lazy" referrerpolicy="no-referrer" class="h-full w-full object-cover transition duration-700 group-hover:scale-[1.03]" alt="${esc(item.title)}" onerror="if(!this.dataset.fallback){this.dataset.fallback='1';this.src='/media/offers/'+this.closest('[data-offer-id]').dataset.offerId+'.svg';}else{this.style.opacity='.18';}" /><div class="absolute inset-x-3 top-3 flex items-start justify-between gap-2"><span class="rounded-full bg-white/90 backdrop-blur px-3 py-1.5 text-[10px] font-black shadow-sm">${score}% توافق</span><span class="rounded-full bg-black/65 text-white backdrop-blur px-3 py-1.5 text-[10px] font-bold">${esc(item.match_type || 'توصية')}</span></div></div><div class="p-4 sm:p-5 flex-1 flex flex-col"><div class="flex items-center justify-between gap-2"><span class="text-[11px] text-neutral-400 font-black">${esc(categoryNames[item.category] || item.category)}</span><span class="text-[11px] text-neutral-400 font-bold">${esc(item.city)}</span></div><h4 class="mt-2 text-sm sm:text-base font-black leading-6">${esc(item.title)}</h4><div class="mt-1 text-xs text-neutral-400 font-bold">${esc(item.merchant_name)}</div><p class="mt-2 text-xs sm:text-sm text-neutral-500 leading-6">${esc(item.description)}</p><ul class="mt-3 space-y-1">${reasons}</ul><div class="mt-3 flex flex-wrap gap-1.5">${tags}</div><div class="mt-auto pt-4 flex items-end justify-between gap-3"><div><div class="text-[10px] text-neutral-400 font-bold">السعر</div><div class="text-lg font-black">${esc(money(item.price_jod))}</div></div><button type="button" onclick='openDeal(${JSON.stringify({id:item.id,title:item.title,price_jod:item.price_jod})})' class="min-h-[48px] px-4 rounded-2xl bg-neutral-950 hover:bg-neutral-800 text-white font-black text-xs sm:text-sm transition active:scale-[0.985]">إضافة للسلة <span class="opacity-60">(1 د)</span></button></div><div class="contact-zone relative mt-4 p-2 rounded-2xl border border-neutral-100 ${knownDeal ? '' : 'hide-links'}" data-card="${index}">${zone}</div></div></article>`;
 }
 
 async function addToCart(item){
@@ -2320,30 +2660,21 @@ resultsTitle.textContent = 'صار خطأ في البحث';
 empty.innerHTML = `<div class="text-4xl mb-3">!</div><div class="font-black">${esc(message)}</div><div class="text-sm text-neutral-500 mt-2">جربي صياغة أخرى للطلب.</div>`;
 }
 
-form.addEventListener('submit', async (event) => {
-event.preventDefault();
-const query = queryEl.value.trim();
-if (!query) return;
-empty.classList.add('hidden');
-grid.innerHTML = '';
-countBadge.classList.add('hidden');
-resultsTitle.textContent = 'جاري تحليل نيتكِ الشرائية…';
-setBusy(true);
-try {
-const response = await fetch('/api/recommend', {
-method: 'POST', headers: {'Content-Type':'application/json'},
-body: JSON.stringify({query, token: authToken})
-});
-const data = await response.json();
-if (!response.ok) throw new Error(data.error || 'تعذر إتمام البحث');
-paidDeals = {};
-sessionId = data.session_id;
-refineForm.classList.remove('hidden');
-renderResults(data);
-} catch (error) {
-renderError(error.message);
-} finally { setBusy(false); }
-});
+async function runSearch(query, isRefresh=false){
+query=(query||'').trim(); if(!query) return;
+empty.classList.add('hidden'); grid.innerHTML=''; countBadge.classList.add('hidden'); resultsTitle.textContent=isRefresh?'نبحث عن خيارات جديدة فعلًا…':'جاري تحليل طلبك والبحث المباشر…'; setBusy(true);
+try{
+ const oldIds=(()=>{try{return JSON.parse(localStorage.getItem(LAST_IDS_KEY)||'[]')}catch(_){return[]}})();
+ const response=await fetch('/api/recommend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,token:authToken,refresh_nonce:isRefresh?String(Date.now()):'',avoid_ids:isRefresh?oldIds:[]})});
+ const data=await response.json(); if(!response.ok) throw new Error(data.error||'تعذر إتمام البحث');
+ paidDeals={}; sessionId=data.session_id; localStorage.setItem(LAST_QUERY_KEY,query); localStorage.setItem(LAST_IDS_KEY,JSON.stringify((data.results||[]).map(x=>x.id)));
+ refineForm.classList.remove('hidden'); if(refreshResultsBtn) refreshResultsBtn.classList.remove('hidden'); renderResults(data);
+ if(data.live_search===false && isRefresh) showToast('البحث المباشر غير متاح حاليًا، فتم استخدام المخزون الداخلي.');
+}catch(error){renderError(error.message);}finally{setBusy(false);}
+}
+
+form.addEventListener('submit', async (event) => { event.preventDefault(); await runSearch(queryEl.value.trim(), false); });
+if(refreshResultsBtn) refreshResultsBtn.addEventListener('click', ()=>runSearch(localStorage.getItem(LAST_QUERY_KEY)||queryEl.value,true));
 
 refineForm.addEventListener('submit', async (event) => {
 event.preventDefault();
@@ -2365,6 +2696,8 @@ renderError(error.message);
 });
 
 initAuth();
+const savedQuery=localStorage.getItem(LAST_QUERY_KEY);
+if(savedQuery){queryEl.value=savedQuery; setTimeout(()=>runSearch(savedQuery,true),350);}
 queryEl.focus();
   </script>
 </body>
@@ -2395,14 +2728,17 @@ def _intent_public(intent: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _recommend_payload(intent: Dict[str, Any], request_id: str, session_id: str, raw_query: str = "") -> Dict[str, Any]:
+def _recommend_payload(intent: Dict[str, Any], request_id: str, session_id: str, raw_query: str = "", refresh_nonce: str = "", avoid_ids: Optional[Sequence[int]] = None) -> Dict[str, Any]:
+    results = recommend(intent, raw_query, refresh_nonce=refresh_nonce, avoid_ids=avoid_ids)
+    save_session_offers(session_id, [int(x["id"]) for x in results])
     return {
         "ok": True,
         "request_id": request_id,
         "session_id": session_id,
         "intent": _intent_public(intent),
-        "results": recommend(intent, raw_query),
+        "results": results,
         "payment": PAYMENT_PROVIDER.instructions(),
+        "live_search": bool(LIVE_SEARCH_ENABLED and gemini_model()),
     }
 
 
@@ -2420,6 +2756,10 @@ def _deal_response(row: Dict[str, Any]) -> Dict[str, Any]:
 ADMIN_HTML_CONTENT_TYPE = "text/html; charset=utf-8"
 
 def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> Tuple[int, List[Tuple[str, str]], bytes]:
+    # Gunicorn imports the WSGI application directly, so make schema initialization
+    # explicit for every request path. This also upgrades an existing SQLite DB
+    # from an older release without requiring a manual migration step.
+    ensure_db()
     headers: List[Tuple[str, str]] = [
         ("X-Content-Type-Options", "nosniff"),
         ("Referrer-Policy", "strict-origin-when-cross-origin"),
@@ -2435,6 +2775,14 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
         if method == "GET":
             if path == "/admin":
                 return 200, headers + [("Content-Type", ADMIN_HTML_CONTENT_TYPE)], _admin_page().encode("utf-8")
+            if path.startswith("/media/offers/") and path.endswith(".svg"):
+                m = re.fullmatch(r"/media/offers/(\d+)\.svg", path)
+                if not m:
+                    return respond({"error":"Not Found"},404)
+                offer = get_offer_by_id(int(m.group(1)))
+                if offer is None:
+                    return respond({"error":"Not Found"},404)
+                return 200, headers + [("Content-Type", "image/svg+xml; charset=utf-8"), ("Cache-Control", "public, max-age=86400")], offer_svg(offer)
             if path.startswith("/api/deal/status"):
                 parsed = urlparse(path)
                 query = parse_qs(parsed.query, keep_blank_values=True)
@@ -2453,9 +2801,10 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 return respond({
                     "ok": True,
                     "service": "التوصية",
-                    "version": "3.0",
+                    "version": "6.0",
                     "port": PORT,
                     "inventory_count": len(SEED_OFFERS),
+                    "live_search_enabled": LIVE_SEARCH_ENABLED,
                     "gemini_enabled": bool(gemini_model()),
                     "timestamp": int(time.time()),
                 })
@@ -2594,6 +2943,16 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                     return respond({"error": "طلب الدفع غير موجود."}, 404)
                 return respond({"ok": True, "status": action})
 
+            if path == "/api/admin/bulk-offer-links":
+                password = str(data.get("password", ""))
+                if not _admin_ok(password):
+                    return respond({"error": "غير مصرح."}, 401)
+                try:
+                    result = bulk_update_offer_links(str(data.get("raw_text", "")))
+                except ValueError as exc:
+                    return respond({"error": str(exc)}, 400)
+                return respond({"ok": True, **result})
+
             if path == "/api/admin/offer-update":
                 password = str(data.get("password", ""))
                 if not _admin_ok(password):
@@ -2671,7 +3030,9 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 save_buyer_intent(request_id, query, intent)
                 user = get_user_from_token(str(data.get("token", "")))
                 create_session(session_id, intent, client_ip, int(user["id"]) if user else None, query)
-                return respond(_recommend_payload(intent, request_id, session_id, query))
+                avoid_ids = data.get("avoid_ids") if isinstance(data.get("avoid_ids"), list) else []
+                refresh_nonce = str(data.get("refresh_nonce", ""))[:80]
+                return respond(_recommend_payload(intent, request_id, session_id, query, refresh_nonce, avoid_ids))
 
             if path == "/api/refine":
                 session_id = str(data.get("session_id", "")).strip()

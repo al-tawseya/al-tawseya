@@ -12,3 +12,7 @@ services:
         sync: false
       - key: GEMINI_MODEL
         value: gemini-2.5-flash
+      - key: LIVE_SEARCH_ENABLED
+        value: "true"
+      - key: LIVE_SEARCH_MAX
+        value: "8"
