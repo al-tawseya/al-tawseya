@@ -2861,7 +2861,7 @@ try{
  const data=await response.json(); if(!response.ok) throw new Error(data.error||'تعذر إتمام البحث');
  paidDeals={}; sessionId=data.session_id; localStorage.setItem(LAST_QUERY_KEY,query); localStorage.setItem(LAST_IDS_KEY,JSON.stringify((data.results||[]).map(x=>x.id)));
  refineForm.classList.remove('hidden'); if(refreshResultsBtn) refreshResultsBtn.classList.remove('hidden'); renderResults(data);
- if(data.live_search===false && isRefresh) showToast('البحث المباشر غير متاح حاليًا، فتم استخدام المخزون الداخلي.');
+ if(data.live_search===false) showToast('البحث المباشر غير متاح حاليًا.');
 }catch(error){renderError(error.message);}finally{setBusy(false);}
 }
 
@@ -2996,7 +2996,7 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 return respond({
                     "ok": True,
                     "service": "التوصية",
-                    "version": "9.0",
+                    "version": "12.0",
                     "port": PORT,
                     "inventory_count": len(SEED_OFFERS),
                     "live_search_enabled": LIVE_SEARCH_ENABLED,
