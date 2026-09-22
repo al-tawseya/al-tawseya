@@ -35,7 +35,7 @@ PORT = int(os.getenv("PORT", "8000"))
 DB_PATH = Path(os.getenv("DATABASE_FILE", "decision_engine.db"))
 if not DB_PATH.is_absolute():
     DB_PATH = Path(__file__).with_name(DB_PATH.name)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 
 logging.basicConfig(
