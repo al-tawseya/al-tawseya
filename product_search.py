@@ -406,6 +406,8 @@ class ProductPageFetcher:
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 final_url = canonicalize_url(resp.geturl())
+                if not final_url:
+                    return {"verification_status": "rejected", "rejection_reason": "unsafe_redirect"}
                 code = int(getattr(resp, "status", 200) or 200)
                 content_type = (resp.headers.get("Content-Type") or "").lower()
                 if code >= 400:
@@ -691,7 +693,7 @@ class ProductNormalizer:
             "merchant_name": merchant,
             "normalized_domain": domain_of(url),
             "price_original": original_price,
-            "currency_original": currency or "JOD",
+            "currency_original": currency,
         }
         return normalized
 
