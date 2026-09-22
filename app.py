@@ -866,41 +866,164 @@ def _extract_grounding_urls(response: Any) -> List[str]:
     return urls
 
 
+def _extract_grounding_sources(response: Any) -> List[Dict[str, str]]:
+    sources: List[Dict[str, str]] = []
+    seen: set = set()
+    try:
+        for candidate in getattr(response, "candidates", None) or []:
+            metadata = getattr(candidate, "grounding_metadata", None)
+            for chunk in getattr(metadata, "grounding_chunks", None) or []:
+                web = getattr(chunk, "web", None)
+                uri = getattr(web, "uri", None) if web else None
+                title = getattr(web, "title", None) if web else None
+                uri = normalize_external_url(uri)
+                if uri and uri not in seen:
+                    sources.append({"url": uri, "title": str(title or "").strip()[:180]})
+                    seen.add(uri)
+    except Exception as exc:
+        LOGGER.debug("Grounding source extraction failed: %s", exc)
+    return sources
+
+
+def fetch_product_metadata(page_url: str) -> Dict[str, Any]:
+    """Read public product metadata from a verified page without inventing values."""
+    page_url = normalize_external_url(page_url)
+    if not page_url:
+        return {}
+    try:
+        req = urllib.request.Request(page_url, headers={"User-Agent": "Mozilla/5.0 AlTawseyaSearch/8.0"})
+        with urllib.request.urlopen(req, timeout=7) as resp:
+            final_url = normalize_external_url(resp.geturl())
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if not final_url or "text/html" not in content_type:
+                return {}
+            raw = resp.read(900_000)
+        text = raw.decode("utf-8", errors="ignore")
+        out: Dict[str, Any] = {"url": final_url, "title": "", "description": "", "image_url": "", "price_jod": None, "currency": ""}
+        # Prefer structured product data (JSON-LD), then OpenGraph/meta tags.
+        for block in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', text, re.I | re.S):
+            try:
+                data = json.loads(html.unescape(block.strip()))
+            except Exception:
+                continue
+            nodes = data if isinstance(data, list) else [data]
+            queue = list(nodes)
+            while queue:
+                node = queue.pop(0)
+                if not isinstance(node, dict):
+                    continue
+                if isinstance(node.get("@graph"), list):
+                    queue.extend(node["@graph"])
+                typ = str(node.get("@type") or "").lower()
+                if "product" not in typ and not node.get("offers"):
+                    continue
+                out["title"] = out["title"] or str(node.get("name") or "").strip()
+                out["description"] = out["description"] or str(node.get("description") or "").strip()
+                image = node.get("image")
+                if isinstance(image, list):
+                    image = image[0] if image else ""
+                if isinstance(image, dict):
+                    image = image.get("url", "")
+                out["image_url"] = out["image_url"] or normalize_external_url(image)
+                offers = node.get("offers")
+                if isinstance(offers, list):
+                    offers = offers[0] if offers else {}
+                if isinstance(offers, dict):
+                    price = safe_float(offers.get("price") or offers.get("lowPrice"))
+                    currency = str(offers.get("priceCurrency") or "").upper()
+                    if price is not None and currency:
+                        out["price_jod"] = price if currency in {"JOD", "JD"} else None
+                        out["currency"] = currency
+                if out["title"] and out["price_jod"] is not None:
+                    break
+        meta_patterns = [
+            ("title", r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)'),
+            ("description", r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)'),
+            ("image_url", r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)'),
+            ("price_jod", r'<meta[^>]+(?:property|name)=["\']product:price:amount["\'][^>]+content=["\']([^"\']+)'),
+            ("currency", r'<meta[^>]+(?:property|name)=["\']product:price:currency["\'][^>]+content=["\']([^"\']+)'),
+        ]
+        for key, pattern in meta_patterns:
+            m = re.search(pattern, text, re.I)
+            if m and not out.get(key):
+                value = html.unescape(m.group(1).strip())
+                if key == "image_url":
+                    value = normalize_external_url(urljoin(final_url, value))
+                elif key == "price_jod":
+                    value = safe_float(value)
+                elif key == "currency":
+                    value = value.upper()
+                out[key] = value
+        if out.get("currency") not in {"", "JOD", "JD"}:
+            out["price_jod"] = None
+        if not out["title"]:
+            m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+            if m:
+                out["title"] = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))).strip()
+        if not out["image_url"]:
+            out["image_url"] = fetch_open_graph_image(final_url)
+        return out
+    except Exception as exc:
+        LOGGER.debug("Product metadata fetch skipped for %s: %s", page_url, exc)
+        return {}
+
+
 def live_search_offers(user_text: str, intent: Dict[str, Any], refresh_nonce: str = "", avoid_urls: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     client = gemini_model()
     if client is None or not LIVE_SEARCH_ENABLED:
         return []
     avoid_urls = [u for u in (avoid_urls or []) if safe_public_url(u)]
-    avoid_block = "\n".join(f"- {u}" for u in avoid_urls[:30]) or "- لا يوجد"
+    search_terms = semantic_search_terms(user_text, intent)
+    search_queries = build_live_search_queries(user_text, intent, refresh_nonce)
+    ai_phrases = [str(x) for x in intent.get("search_phrases", []) if str(x).strip()]
+    query_block = "\n".join(f"- {q}" for q in list(dict.fromkeys(ai_phrases + search_queries))[:10])
+    avoid_block = "\n".join(f"- {u}" for u in avoid_urls[:40]) or "- لا يوجد"
     prompt = f"""
-أنت وكيل بحث تسوق حي للسوق الأردني. استخدم Google Search للبحث الفعلي على الويب الآن، وليس من الذاكرة فقط.
+أنت محرك بحث تسوق حقيقي للسوق الأردني. نفّذ بحث Google حي الآن باستخدام أداة Google Search.
+لا تجب من الذاكرة. تعامل مع الطلب كبحث شراء متعدد الاستعلامات، وليس سؤالًا عامًا.
+
 طلب المستخدم الأصلي: {user_text!r}
+المفاهيم الدلالية والمرادفات: {json.dumps(search_terms[:30], ensure_ascii=False)}
+عبارات البحث المقترحة:
+{query_block}
 النوايا المستخرجة: {json.dumps(_intent_public(intent), ensure_ascii=False)}
 رقم تنويع البحث: {refresh_nonce!r}
-الروابط التي ظهرت في البحث السابق ويجب عدم إعادتها:
-{avoid_block}
 
-أعد JSON فقط بالشكل:
-{{"offers":[{{"title":"اسم المنتج الحقيقي","merchant_name":"اسم المتجر الحقيقي","category":"makeup|clothes|gifts|watches|perfumes|shoes|lingerie|scarves","price_jod":رقم أو null,"description":"وصف قصير مبني على الصفحة","city":"عمّان أو المدينة إن ظهرت أو الأردن","source_url":"الرابط الكامل لصفحة المنتج/العرض","image_url":"رابط صورة مباشرة إن وجد وإلا فارغ","tags":[],"colors":[],"style":[],"sizes":[],"size_system":""}}]}}
+ابحث عبر عدة استعلامات مختلفة. إذا كان الطلب كلمة واحدة، وسّعه دلاليًا قبل البحث.
+مثال: "بنطال" = بنطال/بنطلون/سروال/pants/trousers/jeans.
+مثال: "ستيّانة" = ستيانة/سوتيان/برا/حمالة صدر/صدرية/bra/bras.
+لا تتعامل مع الكلمة المحلية كأنها خطأ أو فئة مجهولة.
 
-قواعد صارمة:
-1) اعتمد فقط منتجات/عروضًا وجدت رابطها في نتائج Google Search.
-2) لا تخترع متجرًا أو رابطًا أو سعرًا. إذا لم تجد سعرًا واضحًا استخدم null، ويفضل حذف المنتج إذا كان السعر غير واضح.
-3) فضّل المتاجر الأردنية أو التي تبيع/تشحن إلى الأردن، وفضّل صفحات المنتجات لا صفحات التواصل العامة.
-4) لا تعيد أي source_url من قائمة الروابط السابقة.
-5) أعطني {LIVE_SEARCH_MAX} نتائج أو أقل حسب ما تجده فعليًا.
-6) اجعل النتائج متنوعة بين متاجر مختلفة قدر الإمكان.
+أعد JSON فقط:
+{{"offers":[{{"title":"اسم المنتج الحقيقي","merchant_name":"اسم المتجر الحقيقي","category":"makeup|clothes|gifts|watches|perfumes|shoes|lingerie|scarves","price_jod":رقم أو null,"description":"وصف قصير من الصفحة","city":"الأردن أو المدينة إن ظهرت","source_url":"الرابط الكامل لصفحة المنتج","image_url":"رابط الصورة إن ظهر","tags":[],"colors":[],"style":[],"sizes":[],"size_system":""}}]}}
+
+قواعد:
+1) يجب أن يكون source_url رابط صفحة منتج/عرض حقيقي، وليس صفحة بحث عامة أو الصفحة الرئيسية كلما أمكن.
+2) لا تخترع أي منتج أو متجر أو سعر.
+3) لا تستخدم نفس الرابط الموجود في قائمة الروابط السابقة.
+4) أعطِ الأولوية للمتاجر الأردنية والمتاجر التي تعرض السعر بالدينار الأردني أو تشحن للأردن.
+5) ابحث في متاجر متعددة، وليس متجرًا واحدًا.
+6) إذا لم تجد السعر في نتيجة البحث، لا تخمّنه؛ اتركه null ودع النظام يقرأ بيانات الصفحة.
+7) أعطِ نتائج متنوعة تغطي مرادفات الطلب.
+8) عند refresh ابحث عن منتجات/متاجر مختلفة، وليس مجرد إعادة ترتيب النتائج القديمة.
 """
     try:
         config = genai_types.GenerateContentConfig(
             response_mime_type="application/json",
             tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+            temperature=0.2,
         ) if genai_types else None
         response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
         data = json.loads(getattr(response, "text", "{}") or "{}")
         candidates = data.get("offers", []) if isinstance(data, dict) else []
-        if not candidates:
-            candidates = [{"source_url": u} for u in _extract_grounding_urls(response)[:LIVE_SEARCH_MAX]]
+        grounding_sources = _extract_grounding_sources(response)
+        # If structured JSON is weak, use the actual grounded URLs as a second discovery layer.
+        if not isinstance(candidates, list):
+            candidates = []
+        existing_urls = {normalize_external_url(x.get("source_url")) for x in candidates if isinstance(x, dict)}
+        for source in grounding_sources:
+            if source["url"] not in existing_urls:
+                candidates.append({"source_url": source["url"], "title": source.get("title", "")})
         out: List[Dict[str, Any]] = []
         seen = set(avoid_urls)
         for item in candidates:
@@ -916,23 +1039,38 @@ def live_search_offers(user_text: str, intent: Dict[str, Any], refresh_nonce: st
             url = final_url or url
             if url in seen:
                 continue
+            metadata = fetch_product_metadata(url)
             price = safe_float(item.get("price_jod"))
+            if price is None:
+                price = safe_float(metadata.get("price_jod"))
             if price is None or price <= 0:
                 continue
             title = str(item.get("title") or "").strip()[:180]
             if len(title) < 3:
+                title = str(metadata.get("title") or "").strip()[:180]
+            if len(title) < 3:
                 continue
-            merchant = str(item.get("merchant_name") or "").strip()[:100] or (urlparse(url).hostname or "متجر")
-            image = normalize_external_url(item.get("image_url")) or fetch_open_graph_image(url)
+            description = str(item.get("description") or "").strip()
+            if not description:
+                description = str(metadata.get("description") or "").strip()
+            merchant = str(item.get("merchant_name") or "").strip()[:100]
+            if not merchant:
+                merchant = (urlparse(url).hostname or "متجر").replace("www.", "")[:100]
+            image = normalize_external_url(item.get("image_url")) or normalize_external_url(metadata.get("image_url")) or fetch_open_graph_image(url)
             oid = _live_offer_id(url)
-            category = str(item.get("category") or "gifts").strip()
+            text_for_category = " ".join([title, description, " ".join(_as_list(item.get("tags"))), url])
+            category = str(item.get("category") or "").strip()
             if category not in CATEGORY_LABELS:
-                category = next(iter(detect_categories(title + " " + str(item.get("description") or ""))), "gifts")
+                detected = detect_categories(text_for_category)
+                category = detected[0] if detected else (intent.get("categories") or ["gifts"])[0]
+            tags = list(dict.fromkeys(_as_list(item.get("tags")) + search_terms[:12]))
+            colors = _as_list(item.get("colors"))
+            style = _as_list(item.get("style"))
             out.append({
                 "id": oid, "merchant_name": merchant, "title": title, "category": category,
-                "price_jod": round(price, 2), "tags": _as_list(item.get("tags")), "colors": _as_list(item.get("colors")),
-                "style": _as_list(item.get("style")), "city": str(item.get("city") or "الأردن")[:60],
-                "description": str(item.get("description") or "عرض تم العثور عليه عبر البحث المباشر")[:360],
+                "price_jod": round(price, 2), "tags": tags, "colors": colors, "style": style,
+                "city": str(item.get("city") or "الأردن")[:60],
+                "description": (description or "عرض حقيقي تم العثور عليه عبر البحث المباشر")[:360],
                 "image_url": image or fallback_image_url(oid), "whatsapp_url": "", "instagram_url": "",
                 "sizes": _as_list(item.get("sizes")), "size_system": str(item.get("size_system") or ""),
                 "store_url": url, "source": "google_search",
@@ -944,7 +1082,6 @@ def live_search_offers(user_text: str, intent: Dict[str, Any], refresh_nonce: st
     except Exception as exc:
         LOGGER.warning("Live Google Search failed; using internal inventory: %s", exc)
         return []
-
 
 
 def gemini_model() -> Any:
