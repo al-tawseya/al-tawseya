@@ -29,6 +29,8 @@ except Exception:  # Optional dependency.
     genai = None
     genai_types = None
 
+from product_search import ProductSearchEngine, SearchDependencies
+
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
@@ -54,6 +56,9 @@ PAYMENT_WEBHOOK_SECRET = os.getenv("PAYMENT_WEBHOOK_SECRET", "").strip()
 AUTH_DAYS = int(os.getenv("AUTH_DAYS", "30"))
 LIVE_SEARCH_ENABLED = os.getenv("LIVE_SEARCH_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 LIVE_SEARCH_MAX = max(4, min(10, int(os.getenv("LIVE_SEARCH_MAX", "8"))))
+SEARCH_QUERY_COUNT = max(6, min(12, int(os.getenv("SEARCH_QUERY_COUNT", "8"))))
+SEARCH_CACHE_TTL = max(30, int(os.getenv("SEARCH_CACHE_TTL", "180")))
+_PRODUCT_SEARCH_ENGINE: Optional[ProductSearchEngine] = None
 
 
 # ---------------------------------------------------------------------------
@@ -775,7 +780,7 @@ def verify_external_url(url: Any, timeout: int = 8) -> Tuple[bool, str, str]:
     try:
         req = urllib.request.Request(
             candidate,
-            headers={"User-Agent": "Mozilla/5.0 AlTawseyaBot/7.0"},
+            headers={"User-Agent": "Mozilla/5.0 AlTawseyaBot/10.0"},
             method="GET",
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -968,152 +973,25 @@ def fetch_product_metadata(page_url: str) -> Dict[str, Any]:
         return {}
 
 
+def product_search_engine() -> ProductSearchEngine:
+    global _PRODUCT_SEARCH_ENGINE
+    if _PRODUCT_SEARCH_ENGINE is None:
+        _PRODUCT_SEARCH_ENGINE = ProductSearchEngine(
+            SearchDependencies(
+                get_gemini_client=gemini_model,
+                model_name=GEMINI_MODEL,
+                live_enabled=LIVE_SEARCH_ENABLED,
+                max_results=LIVE_SEARCH_MAX,
+                query_count=SEARCH_QUERY_COUNT,
+                cache_ttl_seconds=SEARCH_CACHE_TTL,
+                grounding_source_extractor=_extract_grounding_sources,
+            )
+        )
+    return _PRODUCT_SEARCH_ENGINE
+
+
 def live_search_offers(user_text: str, intent: Dict[str, Any], refresh_nonce: str = "", avoid_urls: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    """Discover real product pages first, then extract product data from verified pages."""
-    client = gemini_model()
-    if client is None or not LIVE_SEARCH_ENABLED:
-        return []
-
-    avoid_urls = [u for u in (avoid_urls or []) if safe_public_url(u)]
-    avoid_set = {normalize_external_url(u) for u in avoid_urls if normalize_external_url(u)}
-    search_terms = semantic_search_terms(user_text, intent)
-    raw_queries = build_live_search_queries(user_text, intent, refresh_nonce)
-    ai_phrases = [str(x).strip() for x in intent.get("search_phrases", []) if str(x).strip()]
-
-    queries: List[str] = []
-    for q in ai_phrases + raw_queries:
-        q = str(q).strip()
-        if q and q not in queries:
-            queries.append(q)
-    if not queries:
-        queries = [user_text]
-    queries = queries[:6]
-
-    candidate_urls: List[str] = []
-    candidate_titles: Dict[str, str] = {}
-
-    def add_candidate_url(value: Any, title: str = "") -> None:
-        if not isinstance(value, str):
-            return
-        value = value.strip().strip("()[]{}<>.,;\"'")
-        if not value.startswith(("http://", "https://")):
-            return
-        normalized = normalize_external_url(value)
-        if not normalized or normalized in avoid_set or normalized in candidate_urls:
-            return
-        if safe_public_url(normalized):
-            candidate_urls.append(normalized)
-            if title:
-                candidate_titles[normalized] = title[:180]
-
-    for index, query in enumerate(queries):
-        prompt = f"""
-أنت وكيل بحث تسوق مباشر للسوق الأردني.
-استخدم Google Search الآن وابحث فعليًا عن صفحات منتجات قابلة للشراء، ولا تعتمد على الذاكرة.
-
-طلب المستخدم: {user_text!r}
-مرادفات ومفاهيم المنتج: {json.dumps(search_terms[:30], ensure_ascii=False)}
-النوايا المستخرجة: {json.dumps(_intent_public(intent), ensure_ascii=False)}
-استعلام البحث الحالي: {query!r}
-تنويع البحث: {refresh_nonce!r}
-
-ابحث عن منتجات حقيقية مطابقة للطلب.
-إذا كانت الكلمة عامية أو ناقصة فوسّعها دلاليًا، مثل:
-- بنطال/بنطلون/سروال/pants/trousers/jeans
-- ستيّانة/ستيانه/سوتيان/برا/حمالة صدر/صدرية/bra/bras
-الأولوية: متجر أردني أو صفحة تشحن إلى الأردن، ثم المتاجر العالمية.
-ابحث في أكثر من متجر ولا تكرر نفس المتجر إن وجدت بدائل.
-
-في ردك اذكر روابط صفحات المنتجات الحقيقية فقط، كل رابط في سطر مستقل، مع اسم المنتج إن ظهر.
-لا تخترع أي رابط.
-لا تعطِ صفحة نتائج بحث أو الصفحة الرئيسية إذا كانت صفحة المنتج متاحة.
-لا تستخدم هذه الروابط السابقة:
-{json.dumps(list(avoid_set)[:30], ensure_ascii=False)}
-"""
-        try:
-            config = genai_types.GenerateContentConfig(
-                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-                temperature=0.1,
-            ) if genai_types else None
-            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
-            text_response = getattr(response, "text", "") or ""
-
-            for source in _extract_grounding_sources(response):
-                add_candidate_url(source.get("url"), source.get("title", ""))
-
-            for url in re.findall(r"https?://\S+", text_response):
-                add_candidate_url(url)
-
-            for match in re.findall(r"\]\((https?://[^)\s]+)\)", text_response):
-                add_candidate_url(match)
-        except Exception as exc:
-            LOGGER.warning("Live search query %d failed: %s", index + 1, exc)
-
-        if len(candidate_urls) >= max(18, LIVE_SEARCH_MAX * 2):
-            break
-
-    out: List[Dict[str, Any]] = []
-    seen_urls = set(avoid_set)
-
-    for url in candidate_urls:
-        if url in seen_urls:
-            continue
-
-        verified, final_url, verify_status = verify_external_url(url)
-        if not verified:
-            LOGGER.info("Skipping unverified live offer URL %s (%s)", url, verify_status)
-            continue
-        url = normalize_external_url(final_url or url)
-        if not url or url in seen_urls:
-            continue
-
-        metadata = fetch_product_metadata(url)
-        title = str(metadata.get("title") or candidate_titles.get(url) or "").strip()[:180]
-        description = str(metadata.get("description") or "").strip()[:360]
-        image = normalize_external_url(metadata.get("image_url")) or fetch_open_graph_image(url)
-
-        price = safe_float(metadata.get("price_jod"))
-        if price is None or price <= 0:
-            continue
-        if len(title) < 3:
-            continue
-
-        merchant = (urlparse(url).hostname or "متجر").replace("www.", "")[:100]
-        text_for_category = " ".join([title, description, url, " ".join(search_terms)])
-        detected_categories = detect_categories(text_for_category)
-        category = detected_categories[0] if detected_categories else (intent.get("categories") or ["gifts"])[0]
-
-        combined = normalize_text(f"{title} {description}")
-        colors = [c for c in COLOR_SYNONYMS if normalize_text(c) in combined][:6]
-        tags = list(dict.fromkeys(search_terms[:10]))
-        style = [s for s in intent.get("styles", []) if s in {"luxury","party","modest","classic","minimal","gift"}]
-
-        oid = _live_offer_id(url)
-        out.append({
-            "id": oid,
-            "merchant_name": merchant,
-            "title": title,
-            "category": category,
-            "price_jod": round(price, 2),
-            "tags": tags,
-            "colors": colors,
-            "style": style,
-            "city": "الأردن",
-            "description": description or "منتج حقيقي تم العثور عليه عبر البحث المباشر",
-            "image_url": image or fallback_image_url(oid),
-            "whatsapp_url": "",
-            "instagram_url": "",
-            "sizes": [],
-            "size_system": "",
-            "store_url": url,
-            "source": "google_search",
-        })
-        seen_urls.add(url)
-
-        if len(out) >= LIVE_SEARCH_MAX:
-            break
-
-    return out
+    return product_search_engine().search(user_text, intent, refresh_nonce=refresh_nonce, avoid_urls=avoid_urls or [])
 
 def gemini_model() -> Any:
     global _GEMINI_CLIENT
@@ -2548,7 +2426,7 @@ def score_offer(offer: Offer, intent: Dict[str, Any]) -> Tuple[float, List[str]]
 def recommend(intent: Dict[str, Any], raw_query: str = "", refresh_nonce: str = "", avoid_ids: Optional[Sequence[int]] = None) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     avoid_set = {int(x) for x in (avoid_ids or []) if str(x).isdigit()}
-    for offer in get_offers():
+    for offer in (get_offers() if not raw_query else []):
         if offer.id in avoid_set:
             continue
         score, reasons = score_offer(offer, intent)
@@ -3041,6 +2919,7 @@ def _intent_public(intent: Dict[str, Any]) -> Dict[str, Any]:
         "product_terms": intent.get("product_terms", []),
         "synonyms": intent.get("synonyms", [])[:20],
         "search_phrases": intent.get("search_phrases", [])[:10],
+        "required_traits": intent.get("required_traits", [])[:20],
     }
 
 
@@ -3122,6 +3001,8 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                     "inventory_count": len(SEED_OFFERS),
                     "live_search_enabled": LIVE_SEARCH_ENABLED,
                     "gemini_enabled": bool(gemini_model()),
+                    "search_engine_version": "10.0",
+                    "search_pipeline": ["intent", "queries", "web_discovery", "product_page", "verification", "price_conversion", "dedupe", "price_compare", "hard_filter", "ranking"],
                     "timestamp": int(time.time()),
                 })
             return respond({"error": "Not Found"}, 404)
@@ -3229,6 +3110,11 @@ def route_request(method: str, path: str, body: bytes, client_ip: str = "") -> T
                 if action not in {"paid","rejected"} or not batch_id: return respond({"error":"بيانات القرار غير صالحة."},400)
                 if not set_batch_status(batch_id, action): return respond({"error":"الدفعة غير موجودة."},404)
                 return respond({"ok":True,"status":action})
+
+            if path == "/api/admin/search-debug":
+                password = str(data.get("password", ""))
+                if not _admin_ok(password): return respond({"error":"غير مصرح."},401)
+                return respond({"ok": True, "searches": product_search_engine().debug_snapshot()})
 
             if path == "/api/admin/suggestions":
                 password = str(data.get("password", ""))
