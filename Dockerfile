@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py gunicorn.conf.py ./
+COPY app.py product_search.py gunicorn.conf.py ./
 
 EXPOSE 8000
 
