@@ -380,8 +380,9 @@ CATEGORY_SYNONYMS: Dict[str, set] = {
     },
     "clothes": {
     "ملابس", "لبس", "لبسة", "فستان", "فساتين", "فستين", "فستانه", "عباية", "عبايات",
-    "ساتان", "مخمل", "ثوب", "هودي", "بلوزة", "بلوزه", "تيشيرت", "بنطلون", "جينز",
-    "clothes", "dress", "abaya", "hoodie", "shirt",
+    "ساتان", "مخمل", "ثوب", "هودي", "بلوزة", "بلوزه", "تيشيرت", "بنطلون", "بنطال", "سروال",
+    "سراويل", "جينز", "jeans", "pants", "trousers", "bottoms", "cargo", "leggings", "تنورة",
+    "تنوره", "skirt", "شورت", "shorts", "clothes", "dress", "abaya", "hoodie", "shirt",
     },
     "gifts": {
     "هدية", "هديه", "هدايا", "بوكس", "تخرج", "gift", "gifts", "جوهرة", "مجوهرات",
@@ -399,8 +400,9 @@ CATEGORY_SYNONYMS: Dict[str, set] = {
     "shoes", "heels", "sneakers", "boots", "ballerina", "flats",
     },
     "lingerie": {
-    "برا", "سوتيان", "لانجيري", "حمالة", "حماله", "داخلي", "كولوت",
-    "bra", "lingerie", "underwear",
+    "برا", "براة", "سوتيان", "ستيانه", "ستيّانة", "ستيانة", "حمالة صدر", "حماله صدر", "حمالة",
+    "حماله", "صدرية", "صدرية نسائية", "لانجيري", "داخلي", "ملابس داخلية", "كولوت",
+    "bra", "bras", "brassiere", "lingerie", "underwear",
     },
     "scarves": {
     "شال", "شالات", "طرحة", "طرحه", "طرحات", "حجاب", "اسكارف", "سكارف",
@@ -434,6 +436,75 @@ STYLE_SYNONYMS: Dict[str, set] = {
     "gift": {"هدية", "هديه", "gift"},
     }
 
+# Semantic shopping expansions. These are deliberately broad so a one-word query such as
+# "بنطال" or the Jordanian "ستيّانة" never depends on an exact catalog keyword.
+SEARCH_EXPANSIONS: Dict[str, List[str]] = {
+    "بنطال": ["بنطال", "بنطلون", "سروال", "سراويل", "pants", "trousers", "jeans", "cargo pants", "wide leg pants", "straight leg pants"],
+    "بنطلون": ["بنطلون", "بنطال", "سروال", "pants", "trousers", "jeans", "cargo pants", "wide leg pants"],
+    "سروال": ["سروال", "بنطال", "بنطلون", "pants", "trousers", "jeans", "cargo pants"],
+    "ستيانه": ["ستيّانة", "ستيانه", "سوتيان", "برا", "حمالة صدر", "صدرية", "bra", "bras", "brassiere", "wireless bra", "sports bra"],
+    "ستيّانة": ["ستيّانة", "ستيانه", "سوتيان", "برا", "حمالة صدر", "صدرية", "bra", "bras", "brassiere", "wireless bra", "sports bra"],
+    "سوتيان": ["سوتيان", "ستيّانة", "ستيانه", "برا", "حمالة صدر", "صدرية", "bra", "bras", "brassiere"],
+    "برا": ["برا", "سوتيان", "ستيّانة", "حمالة صدر", "صدرية", "bra", "bras", "brassiere", "wireless bra"],
+    "حمالة صدر": ["حمالة صدر", "سوتيان", "ستيّانة", "برا", "صدرية", "bra", "bras", "brassiere"],
+    "شوز": ["شوز", "حذاء", "كندرة", "sneakers", "shoes", "heels", "boots", "flats"],
+    "حذاء": ["حذاء", "شوز", "كندرة", "shoes", "sneakers", "heels", "boots", "flats"],
+    "فستان": ["فستان", "فساتين", "dress", "dresses", "evening dress", "maxi dress", "modest dress"],
+    "عطر": ["عطر", "عطور", "برفان", "perfume", "fragrance", "parfum", "eau de parfum"],
+    "روج": ["روج", "أحمر شفاه", "حومرة", "حمرة", "lipstick", "liquid lipstick", "lip gloss"],
+    "مكياج": ["مكياج", "ميكب", "makeup", "cosmetics", "beauty"],
+    "عباية": ["عباية", "عبايات", "abaya", "modest abaya", "black abaya"],
+    "طرحة": ["طرحة", "حجاب", "شال", "scarf", "hijab", "shawl"],
+}
+
+
+def semantic_search_terms(user_text: str, intent: Optional[Dict[str, Any]] = None) -> List[str]:
+    clean = normalize_text(user_text)
+    terms: List[str] = []
+    def add(value: Any) -> None:
+        value = normalize_text(str(value or "")).strip()
+        if value and len(value) > 1 and value not in terms:
+            terms.append(value)
+    for key in (intent or {}).get("product_terms", []):
+        add(key)
+        for variant in SEARCH_EXPANSIONS.get(normalize_text(key), []):
+            add(variant)
+    for key, variants in SEARCH_EXPANSIONS.items():
+        if normalize_text(key) in clean:
+            for variant in variants:
+                add(variant)
+    for synonym in (intent or {}).get("synonyms", []):
+        add(synonym)
+    for category in (intent or {}).get("categories", []):
+        for synonym in CATEGORY_SYNONYMS.get(category, set()):
+            add(synonym)
+    return terms[:40]
+
+
+def build_live_search_queries(user_text: str, intent: Dict[str, Any], refresh_nonce: str = "") -> List[str]:
+    terms = semantic_search_terms(user_text, intent)
+    category = ", ".join(intent.get("categories", []))
+    budget = intent.get("budget", {}) or {}
+    constraints = []
+    if budget.get("amount") is not None:
+        constraints.append(f"under {budget['amount']} JOD" if budget.get("kind") == "hard_max" else f"around {budget['amount']} JOD")
+    constraints.extend([str(x) for x in intent.get("colors", [])[:3]])
+    core = " ".join(terms[:8])
+    queries = [
+        f"{user_text} الأردن شراء سعر متجر",
+        f"{core} Jordan JOD price online shopping",
+        f"site:.jo {core} price",
+        f"{core} Amman Jordan store price",
+    ]
+    if category:
+        queries.append(f"{category} {core} الأردن سعر")
+    if constraints:
+        queries.append(f"{core} {' '.join(constraints)} Jordan")
+    if refresh_nonce:
+        queries.append(f"{core} Jordan alternatives different stores {refresh_nonce[-8:]}")
+    return list(dict.fromkeys(q.strip() for q in queries if q.strip()))[:7]
+
+
 STOPWORDS = {
     "بدي", "بديش", "بدّي", "بدها", "بده", "شي", "اشي", "شيء", "الي", "إلي", "لي",
     "مع", "بدون", "لون", "سعر", "ميزانية", "ميزانيتي", "حد", "اقصى", "أقصى", "لحد", "حدود",
@@ -456,6 +527,8 @@ def normalize_text(text: str) -> str:
     text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
     text = text.replace("ى", "ي")
     text = text.replace("ؤ", "و").replace("ئ", "ي")
+    text = text.replace("ة", "ه")
+    text = re.sub(r"[^a-z0-9+#.\-\u0600-\u06ff\s]", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text
 
@@ -647,7 +720,16 @@ def detect_brand(text: str) -> Optional[str]:
 
 def detect_product_terms(text: str) -> List[str]:
     clean = normalize_text(text)
-    return [t for t in tokens(clean) if len(t) > 1 and not re.fullmatch(r"\d+(?:\.\d+)?", t)]
+    found: List[str] = []
+    for term in tokens(clean):
+        if len(term) > 1 and not re.fullmatch(r"\d+(?:\.\d+)?", term):
+            if term not in found:
+                found.append(term)
+            for variant in SEARCH_EXPANSIONS.get(term, []):
+                v = normalize_text(variant)
+                if v and v not in found:
+                    found.append(v)
+    return found[:50]
 
 # ---------------------------------------------------------------------------
 # Optional Gemini extraction (extended schema)
@@ -895,7 +977,8 @@ styles: قائمة من luxury, party, modest, classic, minimal, gift
 sizes: {{"system": bra|shoe_eu|shoe_us|clothing_letter|scarf_dimensions|null, "value": قيمة أو null, "band": رقم أو null, "cup": حرف أو null}}
 brand_soft: اسم براند ذُكر فقط كمرجع أو null
 product_terms: كلمات/مفاهيم أساسية للمنتج حتى لو كانت باللهجة المحلية أو بالإنجليزية
-synonyms: 5-15 مفاهيم بديلة تساعد البحث الدلالي
+synonyms: 10-20 مفاهيم بديلة تساعد البحث الدلالي، ويجب أن تشمل المرادفات الأردنية والشامية والعربية الفصحى والإنجليزية، مثل بنطال/بنطلون/سروال/pants، وستيّانة/سوتيان/برا/حمالة صدر/bra عند اللزوم
+search_phrases: 4-8 عبارات بحث قصيرة وطبيعية تصلح لـ Google Search
 
 قواعد الميزانية: تحت/ما يتجاوز/ما بدفع أكثر = hard_max. بحدود/حوالي/تقريبًا = soft_target. ممكن أزيد لو الجودة = flexible.
 
@@ -974,6 +1057,7 @@ def merge_extraction(local: Dict[str, Any], ai: Dict[str, Any]) -> Dict[str, Any
     colors = list(dict.fromkeys(local.get("colors", []) + _as_list(ai.get("colors"))))
     styles = list(dict.fromkeys(local.get("styles", []) + _as_list(ai.get("styles"))))
     terms = list(dict.fromkeys(local.get("product_terms", []) + _as_list(ai.get("product_terms"))))
+    synonyms = list(dict.fromkeys(_as_list(ai.get("synonyms"))))
     excluded_colors = list(dict.fromkeys(local.get("excluded_colors", []) + _as_list(ai.get("excluded_colors"))))
     excluded_terms = list(dict.fromkeys(local.get("excluded_terms", []) + _as_list(ai.get("excluded_terms"))))
 
@@ -1012,6 +1096,8 @@ def merge_extraction(local: Dict[str, Any], ai: Dict[str, Any]) -> Dict[str, Any
         "brand_soft": local.get("brand_soft") or ai.get("brand_soft"),
         "priority": local.get("priority"),
         "product_terms": terms,
+        "synonyms": synonyms[:30],
+        "search_phrases": list(dict.fromkeys(_as_list(ai.get("search_phrases"))))[:10],
         "raw_ai": ai if isinstance(ai, dict) else {},
     }
 
