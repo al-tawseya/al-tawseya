@@ -387,17 +387,13 @@ class WebSearchEngine:
                     model=self.deps.model_name,
                     input=prompt,
                     tools=[{"type": "google_search"}],
-                    response_format={
-                        "type": "text",
-                        "mime_type": "application/json",
-                        "schema": schema,
-                    },
                 )
 
                 # 1) Parse the structured output. Google documents structured
                 # output + Google Search for Gemini 3-series models.
                 try:
-                    data = json.loads(str(getattr(interaction, "output_text", "") or "{}"))
+                    raw_output = str(getattr(interaction, "output_text", "") or "").strip()
+                    data = json.loads(raw_output) if raw_output.startswith("{") else {}
                 except Exception:
                     data = {}
 
@@ -442,6 +438,40 @@ class WebSearchEngine:
         except Exception as exc:
             errors.append(f"discovery:{type(exc).__name__}")
             LOGGER.warning("Product discovery failed: %s", exc)
+
+            # Hard fallback: legacy generateContent + Google Search. This keeps search
+            # operational if an Interactions request is rejected or changes shape.
+            try:
+                legacy_prompt = f"""
+ابحث على Google الآن عن منتجات حقيقية تطابق:
+{user_text!r}
+
+استخدم هذه الاستعلامات:
+{json.dumps(query_list, ensure_ascii=False)}
+
+أعد روابط صفحات المنتجات الحقيقية فقط، كل رابط في سطر مستقل.
+لا تخترع الروابط ولا تستخدم صفحات النتائج العامة.
+"""
+                legacy = client.models.generate_content(
+                    model=self.deps.model_name,
+                    contents=legacy_prompt,
+                    config=genai_types.GenerateContentConfig(
+                        tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+                        temperature=0.1,
+                    ) if genai_types else None,
+                )
+                legacy_sources = (
+                    self.deps.grounding_source_extractor(legacy)
+                    if self.deps.grounding_source_extractor
+                    else self._grounding_sources(legacy)
+                )
+                legacy_urls = [x.get("url") for x in legacy_sources if x.get("url")]
+                legacy_urls.extend(re.findall(r"https?://\S+", getattr(legacy, "text", "") or ""))
+                for raw_url in legacy_urls:
+                    add_candidate(raw_url)
+            except Exception as legacy_exc:
+                errors.append(f"legacy:{type(legacy_exc).__name__}")
+                LOGGER.warning("Legacy search fallback failed: %s", legacy_exc)
 
         return candidates[:40], {
             "status": "ok" if candidates else "no_candidates",
@@ -603,15 +633,21 @@ class ProductExtractor:
         price = product.get("price")
         currency = product.get("currency", "")
 
-        if price is None:
+        # Always inspect metadata/visible price when either the price OR currency
+        # is missing. Many stores publish JSON-LD price but omit priceCurrency.
+        if price is None or not currency:
             meta = self._meta_price(raw)
-            price = meta.get("price")
-            currency = currency or meta.get("currency", "")
+            if price is None:
+                price = meta.get("price")
+            if not currency:
+                currency = meta.get("currency", "")
 
-        if price is None:
+        if price is None or not currency:
             visible = self._visible_price(raw)
-            price = visible.get("price")
-            currency = currency or visible.get("currency", "")
+            if price is None:
+                price = visible.get("price")
+            if not currency:
+                currency = visible.get("currency", "")
 
         title = re.sub(r"\s+", " ", html.unescape(str(title or ""))).strip()[:220]
         description = re.sub(r"\s+", " ", html.unescape(str(description or ""))).strip()[:500]
@@ -1230,11 +1266,6 @@ class URLContextProductEnricher:
                 model=self.deps.model_name,
                 input=prompt + "\n\nURLs:\n" + "\n".join(urls),
                 tools=[{"type": "url_context"}],
-                response_format={
-                    "type": "text",
-                    "mime_type": "application/json",
-                    "schema": payload_shape,
-                },
             )
             raw = str(getattr(interaction, "output_text", "") or "")
             data = json.loads(raw)
