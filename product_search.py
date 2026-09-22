@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+import ipaddress
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -126,13 +127,31 @@ def normalized_terms(value: Iterable[str]) -> List[str]:
     return out
 
 
+def is_safe_public_url(url: Any) -> bool:
+    try:
+        parsed = urlparse(str(url or "").strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        host = parsed.hostname.strip().lower().rstrip(".")
+        if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal", ".lan")):
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+            return not (
+                ip.is_private or ip.is_loopback or ip.is_link_local or
+                ip.is_multicast or ip.is_reserved or ip.is_unspecified
+            )
+        except ValueError:
+            return True
+    except Exception:
+        return False
+
+
 def canonicalize_url(url: Any) -> str:
     value = str(url or "").strip()
-    if not value:
+    if not value or not is_safe_public_url(value):
         return ""
     parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return ""
     query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
              if not k.lower().startswith(("utm_", "gclid", "fbclid", "mc_cid", "mc_eid", "ref", "affiliate"))]
     clean = parsed._replace(fragment="", query=urlencode(query))
@@ -420,6 +439,18 @@ class ProductExtractor:
         final_url = page.get("final_url") or candidate.get("source_url")
         product = self._from_json_ld(raw)
 
+        og_type = self._meta(raw, "og:type").lower()
+        path = urlparse(final_url).path.lower()
+        product_markers = (
+            bool(product),
+            "product" in og_type,
+            "product:price:amount" in raw.lower(),
+            "/products/" in path,
+            "/product/" in path,
+            "/p/" in path,
+            "/item/" in path,
+        )
+
         title = product.get("title") or self._meta(raw, "og:title") or self._html_title(raw) or candidate.get("grounding_title", "")
         description = product.get("description") or self._meta(raw, "og:description")
         image_url = product.get("image_url") or self._meta(raw, "og:image")
@@ -447,6 +478,9 @@ class ProductExtractor:
         title = re.sub(r"\s+", " ", html.unescape(str(title or ""))).strip()[:220]
         description = re.sub(r"\s+", " ", html.unescape(str(description or ""))).strip()[:500]
         if len(title) < 3:
+            return {"verification_status": "rejected", "rejection_reason": "not_product_page"}
+
+        if not any(product_markers):
             return {"verification_status": "rejected", "rejection_reason": "not_product_page"}
 
         if not price or safe_float(price) is None or safe_float(price) <= 0:
@@ -488,7 +522,7 @@ class ProductExtractor:
                 if isinstance(graph, list):
                     queue.extend(graph)
                 typ = str(node.get("@type") or "").lower()
-                if "product" not in typ and not node.get("offers"):
+                if "product" not in typ:
                     continue
 
                 out["title"] = out.get("title") or str(node.get("name") or "")
@@ -1013,6 +1047,7 @@ class ProductSearchEngine:
         products: List[Dict[str, Any]] = []
         rejection_reasons: Dict[str, int] = {}
         partial_count = 0
+        verified_product_count = 0
 
         for candidate in candidates:
             page = self.fetcher.fetch(candidate["source_url"])
@@ -1048,6 +1083,7 @@ class ProductSearchEngine:
                 rejection_reasons[reason or "low_relevance"] = rejection_reasons.get(reason or "low_relevance", 0) + 1
                 continue
 
+            verified_product_count += 1
             try:
                 product = ProductNormalizer().normalize(product, enriched)
             except ValueError as exc:
@@ -1059,7 +1095,9 @@ class ProductSearchEngine:
             products.append(product)
 
         # Exact URL and cross-store duplicate products are merged before ranking.
+        pre_compare_count = len(products)
         products = self.comparator.compare(products)
+        duplicate_count = max(0, pre_compare_count - len(products))
         products = self.matcher_filter(products, enriched, rejection_reasons)
 
         ranked = self.ranker.rank(products, user_text, enriched, self.deps.max_results)
@@ -1084,10 +1122,10 @@ class ProductSearchEngine:
             "parsed_intent": enriched,
             "generated_queries": queries,
             "number_of_candidates": len(candidates),
-            "number_of_verified_pages": len(products),
+            "number_of_verified_pages": verified_product_count,
             "partial_no_price": partial_count,
             "rejection_reasons": rejection_reasons,
-            "duplicate_count": max(0, len(products) - len(ranked)),
+            "duplicate_count": duplicate_count,
             "final_results": [{"id": x.get("id"), "title": x.get("title"), "store": x.get("merchant_name"), "price_jod": x.get("price_jod")} for x in ranked],
             "search_duration": round(time.time() - started, 3),
             "discovery": discovery_debug,
